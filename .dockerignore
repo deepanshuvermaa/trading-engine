@@ -10,10 +10,15 @@ __pycache__/
 .git/
 .gitignore
 
-# Local market-data cache and generated reports (rebuilt at runtime)
+# Local market-data cache and generated report DATA (rebuilt at runtime).
+# NOTE: exclude only the runtime data subdirs, NOT the reports/ python package
+# (reports/research_note.py, daily_report.py must ship in the image).
 data/storage/
 **/*.parquet
-reports/
+reports/audit/
+reports/daily/
+reports/simulation/
+reports/live/
 
 # Docs and local-only files
 docs/
