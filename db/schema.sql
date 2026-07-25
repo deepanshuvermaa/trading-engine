@@ -1,9 +1,10 @@
 -- Bitcoin Analyser — Postgres persistence schema.
 -- Applied idempotently on startup by db/store.py (CREATE ... IF NOT EXISTS).
 
--- Singleton engine state: one row, id pinned to 1.
+-- COHORT MODE: engine_state holds ONE row per paper portfolio (cohort),
+-- keyed by portfolio_id. A single 'DISTRIBUTED' row == the original behaviour.
 CREATE TABLE IF NOT EXISTS engine_state (
-    id              INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    portfolio_id    TEXT NOT NULL DEFAULT 'DISTRIBUTED',
     equity          DOUBLE PRECISION NOT NULL,
     peak_equity     DOUBLE PRECISION NOT NULL,
     initial_capital DOUBLE PRECISION NOT NULL,
@@ -12,10 +13,18 @@ CREATE TABLE IF NOT EXISTS engine_state (
     params          JSONB NOT NULL DEFAULT '{}'::jsonb,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Migrate the old singleton shape (id INT PK CHECK id=1) idempotently: drop the
+-- id PK/column, add portfolio_id (existing row defaults to DISTRIBUTED), and
+-- enforce one row per cohort via a unique index (used by ON CONFLICT).
+ALTER TABLE engine_state DROP CONSTRAINT IF EXISTS engine_state_pkey;
+ALTER TABLE engine_state DROP COLUMN IF EXISTS id;
+ALTER TABLE engine_state ADD COLUMN IF NOT EXISTS portfolio_id TEXT NOT NULL DEFAULT 'DISTRIBUTED';
+CREATE UNIQUE INDEX IF NOT EXISTS engine_state_portfolio_id_key ON engine_state (portfolio_id);
 
--- Open positions (one row per symbol; deleted on close).
+-- Open positions (one row per cohort+symbol; deleted on close).
 CREATE TABLE IF NOT EXISTS positions (
-    symbol      TEXT PRIMARY KEY,
+    portfolio_id TEXT NOT NULL DEFAULT 'DISTRIBUTED',
+    symbol      TEXT NOT NULL,
     side        TEXT NOT NULL,
     entry_price DOUBLE PRECISION NOT NULL,
     stop_loss   DOUBLE PRECISION NOT NULL,
@@ -26,10 +35,14 @@ CREATE TABLE IF NOT EXISTS positions (
     reasons     JSONB NOT NULL DEFAULT '[]'::jsonb,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS portfolio_id TEXT NOT NULL DEFAULT 'DISTRIBUTED';
+ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_pkey;
+CREATE UNIQUE INDEX IF NOT EXISTS positions_pid_symbol_key ON positions (portfolio_id, symbol);
 
--- Trade journal (OPEN rows + closed rows; upserted by engine trade id).
+-- Trade journal (OPEN rows + closed rows; upserted by (cohort, engine trade id)).
 CREATE TABLE IF NOT EXISTS trades (
-    id             TEXT PRIMARY KEY,
+    id             TEXT NOT NULL,
+    portfolio_id   TEXT NOT NULL DEFAULT 'DISTRIBUTED',
     ts             TIMESTAMPTZ NOT NULL DEFAULT now(),
     symbol         TEXT NOT NULL,
     side           TEXT,
@@ -42,8 +55,12 @@ CREATE TABLE IF NOT EXISTS trades (
     rule_citations JSONB NOT NULL DEFAULT '[]'::jsonb,
     detail         JSONB NOT NULL DEFAULT '{}'::jsonb
 );
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS portfolio_id TEXT NOT NULL DEFAULT 'DISTRIBUTED';
+ALTER TABLE trades DROP CONSTRAINT IF EXISTS trades_pkey;
+CREATE UNIQUE INDEX IF NOT EXISTS trades_pid_id_key ON trades (portfolio_id, id);
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades (ts);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol);
+CREATE INDEX IF NOT EXISTS idx_trades_portfolio ON trades (portfolio_id);
 
 -- Mirror of control/decision_audit.py JSONL entries.
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -92,12 +109,15 @@ CREATE TABLE IF NOT EXISTS memory_log (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_log_ts ON memory_log (ts);
 
--- Equity curve, one point per cycle.
+-- Equity curve, one point per cohort per cycle.
 CREATE TABLE IF NOT EXISTS equity_curve (
     id           BIGSERIAL PRIMARY KEY,
+    portfolio_id TEXT NOT NULL DEFAULT 'DISTRIBUTED',
     ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
     equity       DOUBLE PRECISION NOT NULL,
     drawdown_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
     positions    INT NOT NULL DEFAULT 0
 );
+ALTER TABLE equity_curve ADD COLUMN IF NOT EXISTS portfolio_id TEXT NOT NULL DEFAULT 'DISTRIBUTED';
 CREATE INDEX IF NOT EXISTS idx_equity_curve_ts ON equity_curve (ts);
+CREATE INDEX IF NOT EXISTS idx_equity_curve_portfolio ON equity_curve (portfolio_id);

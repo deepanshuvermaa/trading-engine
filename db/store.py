@@ -125,16 +125,16 @@ class Store:
         async with self.pool.acquire() as conn:
             return await conn.fetch(sql, *args)
 
-    # ── engine_state (singleton row) ─────────────────────────────────────
+    # ── engine_state (one row PER cohort, keyed by portfolio_id) ──────────
 
     async def save_engine_state(self, state: dict) -> None:
         await self._execute(
             """
             INSERT INTO engine_state
-                (id, equity, peak_equity, initial_capital, target_equity,
-                 cycle, params, updated_at)
-            VALUES (1, $1, $2, $3, $4, $5, $6, now())
-            ON CONFLICT (id) DO UPDATE SET
+                (portfolio_id, equity, peak_equity, initial_capital,
+                 target_equity, cycle, params, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+            ON CONFLICT (portfolio_id) DO UPDATE SET
                 equity = EXCLUDED.equity,
                 peak_equity = EXCLUDED.peak_equity,
                 initial_capital = EXCLUDED.initial_capital,
@@ -143,24 +143,38 @@ class Store:
                 params = EXCLUDED.params,
                 updated_at = now()
             """,
+            state.get("portfolio_id") or "DISTRIBUTED",
             float(state["equity"]), float(state["peak_equity"]),
             float(state["initial_capital"]), float(state["target_equity"]),
             int(state.get("cycle", 0)), _jsonable(state.get("params") or {}),
         )
 
+    async def load_engine_states(self) -> list[dict]:
+        """Every cohort's persisted state row."""
+        rows = await self._fetch("SELECT * FROM engine_state")
+        return [
+            {
+                "portfolio_id": r["portfolio_id"],
+                "equity": r["equity"],
+                "peak_equity": r["peak_equity"],
+                "initial_capital": r["initial_capital"],
+                "target_equity": r["target_equity"],
+                "cycle": r["cycle"],
+                "params": r["params"] or {},
+            }
+            for r in rows
+        ]
+
     async def load_engine_state(self) -> dict | None:
-        rows = await self._fetch("SELECT * FROM engine_state WHERE id = 1")
+        """Backward-compat single-row loader (returns the DISTRIBUTED cohort,
+        else the first row)."""
+        rows = await self.load_engine_states()
         if not rows:
             return None
-        r = rows[0]
-        return {
-            "equity": r["equity"],
-            "peak_equity": r["peak_equity"],
-            "initial_capital": r["initial_capital"],
-            "target_equity": r["target_equity"],
-            "cycle": r["cycle"],
-            "params": r["params"] or {},
-        }
+        for r in rows:
+            if r["portfolio_id"] == "DISTRIBUTED":
+                return r
+        return rows[0]
 
     # ── positions ────────────────────────────────────────────────────────
 
@@ -168,10 +182,10 @@ class Store:
         await self._execute(
             """
             INSERT INTO positions
-                (symbol, side, entry_price, stop_loss, take_profit, size,
-                 module, opened_at, reasons, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
-            ON CONFLICT (symbol) DO UPDATE SET
+                (portfolio_id, symbol, side, entry_price, stop_loss,
+                 take_profit, size, module, opened_at, reasons, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+            ON CONFLICT (portfolio_id, symbol) DO UPDATE SET
                 side = EXCLUDED.side,
                 entry_price = EXCLUDED.entry_price,
                 stop_loss = EXCLUDED.stop_loss,
@@ -182,19 +196,24 @@ class Store:
                 reasons = EXCLUDED.reasons,
                 updated_at = now()
             """,
+            p.get("portfolio_id") or "DISTRIBUTED",
             p["symbol"], p["side"], float(p["entry_price"]),
             float(p["stop_loss"]), float(p["take_profit"]), float(p["size"]),
             p.get("module"), p.get("opened_at"),
             _jsonable(p.get("reasons") or []),
         )
 
-    async def delete_position(self, symbol: str) -> None:
-        await self._execute("DELETE FROM positions WHERE symbol = $1", symbol)
+    async def delete_position(self, symbol: str,
+                              portfolio_id: str = "DISTRIBUTED") -> None:
+        await self._execute(
+            "DELETE FROM positions WHERE portfolio_id = $1 AND symbol = $2",
+            portfolio_id, symbol)
 
     async def load_positions(self) -> list[dict]:
         rows = await self._fetch("SELECT * FROM positions ORDER BY opened_at")
         return [
             {
+                "portfolio_id": r["portfolio_id"],
                 "symbol": r["symbol"], "side": r["side"],
                 "entry_price": r["entry_price"], "stop_loss": r["stop_loss"],
                 "take_profit": r["take_profit"], "size": r["size"],
@@ -210,10 +229,10 @@ class Store:
         await self._execute(
             """
             INSERT INTO trades
-                (id, symbol, side, entry_price, exit_price, size, pnl,
-                 reason, module, rule_citations, detail)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ON CONFLICT (id) DO UPDATE SET
+                (id, portfolio_id, symbol, side, entry_price, exit_price, size,
+                 pnl, reason, module, rule_citations, detail)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (portfolio_id, id) DO UPDATE SET
                 symbol = EXCLUDED.symbol,
                 side = EXCLUDED.side,
                 entry_price = EXCLUDED.entry_price,
@@ -225,7 +244,8 @@ class Store:
                 rule_citations = EXCLUDED.rule_citations,
                 detail = EXCLUDED.detail
             """,
-            t["id"], t["symbol"], t.get("side"),
+            t["id"], t.get("portfolio_id") or "DISTRIBUTED",
+            t["symbol"], t.get("side"),
             _f(t.get("entry")), _f(t.get("exit")), _f(t.get("size")),
             _f(t.get("pnl")), t.get("reason"), t.get("module"),
             _jsonable(t.get("rule_citations") or []),
@@ -233,15 +253,17 @@ class Store:
                        if k not in ("rule_citations",)}),
         )
 
-    async def load_trades(self, limit: int = 1000) -> list[dict]:
+    async def load_trades(self, limit: int = 1000,
+                          portfolio_id: str = "DISTRIBUTED") -> list[dict]:
         rows = await self._fetch(
-            "SELECT * FROM (SELECT * FROM trades ORDER BY id DESC LIMIT $1) s "
-            "ORDER BY id ASC", limit)
+            "SELECT * FROM (SELECT * FROM trades WHERE portfolio_id = $2 "
+            "ORDER BY id DESC LIMIT $1) s ORDER BY id ASC", limit, portfolio_id)
         out = []
         for r in rows:
             d = r["detail"] or {}
             out.append({
                 "id": r["id"],
+                "portfolio_id": r["portfolio_id"],
                 "date": d.get("date"),
                 "symbol": r["symbol"], "side": r["side"],
                 "entry": r["entry_price"], "exit": r["exit_price"],
@@ -331,17 +353,20 @@ class Store:
 
     # ── equity curve ─────────────────────────────────────────────────────
 
-    async def log_equity_point(self, pt: dict) -> None:
+    async def log_equity_point(self, pt: dict,
+                               portfolio_id: str = "DISTRIBUTED") -> None:
         await self._execute(
-            "INSERT INTO equity_curve (equity, drawdown_pct, positions) "
-            "VALUES ($1, $2, $3)",
+            "INSERT INTO equity_curve (portfolio_id, equity, drawdown_pct, "
+            "positions) VALUES ($1, $2, $3, $4)",
+            portfolio_id,
             float(pt.get("equity", 0.0)), float(pt.get("drawdown_pct", 0.0)),
             int(pt.get("positions", 0)))
 
-    async def load_equity_curve(self, limit: int = 500) -> list[dict]:
+    async def load_equity_curve(self, limit: int = 500,
+                                portfolio_id: str = "DISTRIBUTED") -> list[dict]:
         rows = await self._fetch(
-            "SELECT * FROM (SELECT * FROM equity_curve ORDER BY id DESC "
-            "LIMIT $1) s ORDER BY id ASC", limit)
+            "SELECT * FROM (SELECT * FROM equity_curve WHERE portfolio_id = $2 "
+            "ORDER BY id DESC LIMIT $1) s ORDER BY id ASC", limit, portfolio_id)
         return [
             {
                 "date": r["ts"].isoformat(), "equity": r["equity"],

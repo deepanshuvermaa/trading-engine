@@ -125,6 +125,102 @@ TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240
 IST = ZoneInfo("Asia/Kolkata")
 US_EASTERN = ZoneInfo("America/New_York")
 
+# ── COHORT MODE ──────────────────────────────────────────────────────
+# Several isolated paper portfolios in ONE process, all seeing the SAME data
+# at the SAME instant (one fetch, one FinBERT, one shared learning brain), so
+# the operator can see WHERE the edge lives: all-in crypto vs all-in US vs
+# all-in NSE vs distributed. Internal market codes are crypto|us|india (see
+# AutonomousEngine.market_of); cohort specs accept friendly aliases.
+ALL_MARKETS = {"crypto", "us", "india"}
+_MARKET_ALIASES = {
+    "crypto": "crypto", "cryptocurrency": "crypto", "coin": "crypto",
+    "us": "us", "us_equity": "us", "us_equities": "us", "usequity": "us",
+    "nasdaq": "us", "nyse": "us", "america": "us",
+    "india": "india", "indian_equity": "india", "indian_equities": "india",
+    "nse": "india", "bse": "india",
+    "all": None, "*": None, "distributed": None,
+}
+
+
+def _canon_markets(spec) -> set[str] | None:
+    """Map a cohort market spec (str/list) to a set of internal codes, or None
+    for 'all markets'. Unknown tokens are dropped; empty -> all markets."""
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        tokens = [t for t in spec.replace("+", ",").replace("|", ",").split(",")]
+    else:
+        tokens = list(spec)
+    out: set[str] = set()
+    for t in tokens:
+        key = str(t).strip().lower()
+        if not key:
+            continue
+        if key not in _MARKET_ALIASES:
+            continue
+        mapped = _MARKET_ALIASES[key]
+        if mapped is None:
+            return None  # an explicit 'all' widens the cohort to every market
+        out.add(mapped)
+    return out or None
+
+
+# The four standard scenarios (each seeded at INITIAL_CAPITAL). DISTRIBUTED
+# reproduces today's single-portfolio behaviour exactly (all markets allowed).
+_DEFAULT_COHORTS = [
+    ("CRYPTO-ONLY", {"crypto"}),
+    ("US-ONLY", {"us"}),
+    ("NSE-ONLY", {"india"}),
+    ("DISTRIBUTED", None),
+]
+
+
+def parse_cohorts(raw: str | None) -> list[tuple[str, set[str] | None]]:
+    """Resolve the COHORTS env var into [(name, market_filter), ...].
+
+    - unset/empty            -> a single DISTRIBUTED portfolio (all markets):
+                                exactly today's behaviour, nothing breaks.
+    - 'default'/'4'/'all'/'standard'/'cohorts' -> the four standard cohorts.
+    - JSON: [{"name": "X", "markets": ["crypto"]}, ...]
+    - simple spec: 'CRYPTO-ONLY:crypto;US-ONLY:us_equity;DISTRIBUTED:all'
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return [("DISTRIBUTED", None)]
+    if raw.lower() in ("default", "standard", "4", "four", "all", "cohorts", "on"):
+        return [(name, mf) for name, mf in _DEFAULT_COHORTS]
+
+    # JSON form
+    if raw[0] in "[{":
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                data = [data]
+            cohorts: list[tuple[str, set[str] | None]] = []
+            for item in data:
+                name = str(item.get("name") or item.get("id") or "COHORT").strip()
+                markets = item.get("markets", item.get("market"))
+                cohorts.append((name, _canon_markets(markets)))
+            if cohorts:
+                return cohorts
+        except (json.JSONDecodeError, AttributeError, TypeError) as e:
+            log.warning(f"COHORTS: could not parse JSON ({e}); "
+                        f"falling back to the four standard cohorts")
+            return [(name, mf) for name, mf in _DEFAULT_COHORTS]
+
+    # simple 'NAME:markets;NAME:markets' spec
+    cohorts = []
+    for chunk in raw.replace("\n", ";").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" in chunk:
+            name, markets = chunk.split(":", 1)
+        else:
+            name, markets = chunk, "all"
+        cohorts.append((name.strip() or "COHORT", _canon_markets(markets)))
+    return cohorts or [("DISTRIBUTED", None)]
+
 
 def market_hours_status(now: datetime | None = None) -> dict:
     """Open/closed per market. NSE 09:15-15:30 IST Mon-Fri;
@@ -196,6 +292,82 @@ class Position:
         }
 
 
+class Portfolio:
+    """One isolated paper-trading scenario (a COHORT).
+
+    Holds its OWN capital, equity, peak, drawdown, open positions, closed
+    trades, equity curve and cost accounting, plus a `market_filter` (a set of
+    allowed internal market codes, or None for all markets). Every cohort shares
+    the engine's single data fetch, one FinBERT snapshot and one learning brain;
+    only the money and the book are private. A lone DISTRIBUTED portfolio
+    (market_filter=None) reproduces the engine's original single-portfolio
+    behaviour byte-for-byte."""
+
+    def __init__(self, pid: str, name: str, initial_capital: float,
+                 market_filter: set[str] | None = None):
+        self.id = pid
+        self.name = name
+        self.market_filter = set(market_filter) if market_filter else None
+        self.initial_capital = initial_capital
+        self.equity = initial_capital
+        self.peak_equity = initial_capital
+        self.drawdown_pct = 0.0
+        self.cost_drag_total = 0.0
+        self.positions: dict[str, Position] = {}
+        self.closed_trades: list[dict] = []
+        self.equity_curve: list[dict] = []
+        # Per-cohort module tracking (the shared brain still learns from all).
+        self.agent_stats = {
+            "trend_follower": {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0},
+            "mean_reverter": {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0},
+            "breakout": {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0},
+        }
+        # Per-cohort transient decision state (keyed by symbol — unique within
+        # a cohort's own book even when peers hold the same symbol).
+        self._verdicts: dict[str, object] = {}
+        self._entry_votes: dict[str, list] = {}
+        self._position_consensus: dict[str, dict] = {}
+
+    def allows(self, market: str) -> bool:
+        """True if this cohort is permitted to trade the given internal market."""
+        return self.market_filter is None or market in self.market_filter
+
+    def market_label(self) -> str:
+        return "all" if self.market_filter is None else "+".join(sorted(self.market_filter))
+
+    def next_trade_id(self) -> str:
+        return f"T{len(self.closed_trades) + 1:04d}"
+
+    def summary(self) -> dict:
+        """Compact snapshot for the dashboard SCOREBOARD / /api/cohorts."""
+        closed = [t for t in self.closed_trades
+                  if t.get("pnl") is not None]
+        unrealized = sum(p.unrealized for p in self.positions.values())
+        return {
+            "id": self.id,
+            "name": self.name,
+            "market_filter": sorted(self.market_filter) if self.market_filter else ["all"],
+            "market_label": self.market_label(),
+            "capital": round(self.initial_capital, 4),
+            "equity": round(self.equity, 4),
+            "equity_mark": round(self.equity + unrealized, 4),
+            "unrealized_pnl": round(unrealized, 4),
+            "peak_equity": round(self.peak_equity, 4),
+            "pnl": round(self.equity - self.initial_capital, 4),
+            "return_pct": round((self.equity - self.initial_capital)
+                                / self.initial_capital * 100, 2)
+            if self.initial_capital else 0.0,
+            "drawdown": round(self.drawdown_pct, 4),
+            "open_positions": len(self.positions),
+            "closed_trades": len(closed),
+            "cost_drag": round(self.cost_drag_total, 4),
+            "equity_curve": [
+                {"date": p.get("date"), "equity": p.get("equity")}
+                for p in self.equity_curve[-120:]
+            ],
+        }
+
+
 class AutonomousEngine:
     def __init__(self):
         self.settings = load_settings()
@@ -211,16 +383,14 @@ class AutonomousEngine:
         self.universe = UniverseDiscovery(cache_minutes=UNIVERSE_CACHE_MINUTES)
         self.symbol_markets: dict[str, str] = {}  # symbol -> crypto|us|india
         self.attribution = TradeAttribution(rule_stats=self.brain.stats)
-        self._verdicts: dict[str, object] = {}  # symbol -> last RuleVerdict
         # The Partners' Room — 10 deterministic investor personas + managers
         self.personas = PersonaEngine(brain=self.brain)
         self.risk_manager = RiskManagerAgent()
         self.portfolio_manager = PortfolioManagerAgent(stats=self.personas.stats)
-        self._entry_votes: dict[str, list] = {}    # symbol -> persona votes at entry
-        self._position_consensus: dict[str, dict] = {}  # symbol -> consensus at entry
         # Live-tunable parameters (module constants are just the defaults;
         # the dashboard's Editor's Desk mutates these through apply_config).
-        self.initial_capital = INITIAL_CAPITAL
+        # initial_capital is a property delegating to the primary cohort (seeded
+        # at INITIAL_CAPITAL above); only the shared, engine-level knobs live here.
         self.target_equity = TARGET_EQUITY
         self.scan_interval_minutes = SCAN_INTERVAL_MINUTES
         self.max_position_pct = MAX_POSITION_PCT
@@ -233,10 +403,20 @@ class AutonomousEngine:
         self.trail_distance_atr = TRAIL_DISTANCE_ATR
         self.last_sentry_run: str | None = None
 
-        self.equity = INITIAL_CAPITAL
-        self.peak_equity = INITIAL_CAPITAL
-        self.drawdown_pct = 0.0
-        self.cost_drag_total = 0.0  # cumulative commissions + slippage paid (USD)
+        # ── COHORTS: one or more isolated paper portfolios (see parse_cohorts).
+        # A single DISTRIBUTED cohort (COHORTS unset) == the original behaviour.
+        specs = parse_cohorts(os.environ.get("COHORTS"))
+        self.portfolios: dict[str, Portfolio] = {}
+        for name, market_filter in specs:
+            pid = name
+            self.portfolios[pid] = Portfolio(
+                pid, name, INITIAL_CAPITAL, market_filter)
+        # The "primary" cohort drives every legacy top-level dashboard panel so
+        # nothing renders differently in single-portfolio mode: prefer
+        # DISTRIBUTED, else the first cohort declared.
+        self.primary: Portfolio = (
+            self.portfolios.get("DISTRIBUTED")
+            or next(iter(self.portfolios.values())))
 
         # ── The daily improvement loop (Karpathy keep-or-revert) ──
         self._anchors_frozen = True
@@ -245,9 +425,6 @@ class AutonomousEngine:
         self.loop_best_metric: float | None = None
         self.loop_holdout_sharpe: float | None = None
         self.loop_open_hypotheses: list[str] = []
-        self.positions: dict[str, Position] = {}
-        self.closed_trades: list[dict] = []
-        self.equity_curve: list[dict] = []
         self.memory: list[dict] = []
         self.cycle = 0
         self.running = True
@@ -255,12 +432,58 @@ class AutonomousEngine:
         self.last_scan_at: str | None = None
         self._scan_now_event = asyncio.Event()
 
-        # Agent (module) tracking
-        self.agent_stats = {
-            "trend_follower": {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0},
-            "mean_reverter": {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0},
-            "breakout": {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0},
-        }
+    # ── Backward-compat: top-level engine state proxies the PRIMARY cohort ──
+    # so every legacy method / dashboard panel that reads self.equity, etc.
+    # keeps working unchanged in single-portfolio mode.
+    @property
+    def equity(self): return self.primary.equity
+    @equity.setter
+    def equity(self, v): self.primary.equity = v
+
+    @property
+    def peak_equity(self): return self.primary.peak_equity
+    @peak_equity.setter
+    def peak_equity(self, v): self.primary.peak_equity = v
+
+    @property
+    def drawdown_pct(self): return self.primary.drawdown_pct
+    @drawdown_pct.setter
+    def drawdown_pct(self, v): self.primary.drawdown_pct = v
+
+    @property
+    def cost_drag_total(self): return self.primary.cost_drag_total
+    @cost_drag_total.setter
+    def cost_drag_total(self, v): self.primary.cost_drag_total = v
+
+    @property
+    def initial_capital(self): return self.primary.initial_capital
+    @initial_capital.setter
+    def initial_capital(self, v): self.primary.initial_capital = v
+
+    @property
+    def positions(self): return self.primary.positions
+
+    @property
+    def closed_trades(self): return self.primary.closed_trades
+    @closed_trades.setter
+    def closed_trades(self, v): self.primary.closed_trades = v
+
+    @property
+    def equity_curve(self): return self.primary.equity_curve
+    @equity_curve.setter
+    def equity_curve(self, v): self.primary.equity_curve = v
+
+    @property
+    def agent_stats(self): return self.primary.agent_stats
+
+    @property
+    def _verdicts(self): return self.primary._verdicts
+
+    @property
+    def _entry_votes(self): return self.primary._entry_votes
+
+    @property
+    def _position_consensus(self): return self.primary._position_consensus
 
     def _mem(self, msg: str, mtype: str = "info"):
         entry = {"ts": datetime.now(timezone.utc).isoformat(), "msg": msg, "type": mtype.upper()}
@@ -276,14 +499,19 @@ class AutonomousEngine:
 
     # ── Persistence (Postgres via db/store.py; no-op without DATABASE_URL) ──
 
-    def _engine_state_row(self) -> dict:
+    def _engine_state_row(self, portfolio: "Portfolio | None" = None) -> dict:
+        p = portfolio or self.primary
         return {
-            "equity": self.equity,
-            "peak_equity": self.peak_equity,
-            "initial_capital": self.initial_capital,
+            "portfolio_id": p.id,
+            "equity": p.equity,
+            "peak_equity": p.peak_equity,
+            "initial_capital": p.initial_capital,
             "target_equity": self.target_equity,
             "cycle": self.cycle,
             "params": {
+                "name": p.name,
+                "market_filter": (sorted(p.market_filter)
+                                  if p.market_filter else None),
                 "scan_interval_minutes": self.scan_interval_minutes,
                 "max_concurrent": self.max_concurrent,
                 "max_position_pct": self.max_position_pct,
@@ -292,36 +520,36 @@ class AutonomousEngine:
                 "trail_activation_atr": self.trail_activation_atr,
                 "trail_distance_atr": self.trail_distance_atr,
                 "paused": self.paused,
-                "cost_drag_total": self.cost_drag_total,
+                "cost_drag_total": p.cost_drag_total,
                 "last_outer_run": self.last_outer_run,
-                "agent_stats": self.agent_stats,
+                "agent_stats": p.agent_stats,
             },
         }
 
     def _persist_engine_state(self):
-        """Fire-and-forget snapshot of the singleton engine_state row."""
+        """Fire-and-forget snapshot of every cohort's engine_state row."""
         if self.store.enabled:
-            self.store.fire(self.store.save_engine_state(self._engine_state_row()))
+            for p in self.portfolios.values():
+                self.store.fire(self.store.save_engine_state(self._engine_state_row(p)))
 
-    async def restore_state(self):
-        """Connect the store and resume from Postgres where we left off."""
-        await self.store.init()
-        if not self.store.enabled:
-            self._mem("Persistence: DATABASE_URL not set — local JSONL/file "
-                      "fallback only (state resets on restart)")
-            return
-
-        st = await self.store.load_engine_state()
-        if st:
-            self.equity = float(st["equity"])
-            self.peak_equity = float(st["peak_equity"])
-            self.initial_capital = float(st["initial_capital"])
+    def _restore_portfolio(self, portfolio: "Portfolio", st: dict):
+        """Apply a persisted engine_state row to one cohort. Engine-level
+        (shared) knobs are taken from the primary cohort's row only."""
+        portfolio.equity = float(st["equity"])
+        portfolio.peak_equity = float(st["peak_equity"])
+        portfolio.initial_capital = float(st["initial_capital"])
+        portfolio.drawdown_pct = (
+            (portfolio.peak_equity - portfolio.equity) / portfolio.peak_equity * 100
+            if portfolio.peak_equity > 0 else 0.0)
+        params = st.get("params") or {}
+        portfolio.cost_drag_total = float(
+            params.get("cost_drag_total", portfolio.cost_drag_total))
+        saved_agents = params.get("agent_stats") or {}
+        for name, stats in saved_agents.items():
+            portfolio.agent_stats[name] = stats
+        if portfolio is self.primary:
             self.target_equity = float(st["target_equity"])
             self.cycle = int(st["cycle"])
-            self.drawdown_pct = (
-                (self.peak_equity - self.equity) / self.peak_equity * 100
-                if self.peak_equity > 0 else 0.0)
-            params = st.get("params") or {}
             self.scan_interval_minutes = int(
                 params.get("scan_interval_minutes", self.scan_interval_minutes))
             self.max_concurrent = int(
@@ -336,16 +564,32 @@ class AutonomousEngine:
                 params.get("trail_activation_atr", self.trail_activation_atr))
             self.trail_distance_atr = float(
                 params.get("trail_distance_atr", self.trail_distance_atr))
-            self.cost_drag_total = float(
-                params.get("cost_drag_total", self.cost_drag_total))
             self.last_outer_run = params.get("last_outer_run", self.last_outer_run)
-            saved_agents = params.get("agent_stats") or {}
-            for name, stats in saved_agents.items():
-                self.agent_stats[name] = stats
 
-        # Open positions
+    async def restore_state(self):
+        """Connect the store and resume every cohort from Postgres."""
+        await self.store.init()
+        if not self.store.enabled:
+            self._mem("Persistence: DATABASE_URL not set — local JSONL/file "
+                      "fallback only (state resets on restart)")
+            return
+
+        rows = await self.store.load_engine_states()
+        by_id = {r["portfolio_id"]: r for r in rows}
+        any_restored = False
+        for pid, portfolio in self.portfolios.items():
+            st = by_id.get(pid)
+            if st:
+                self._restore_portfolio(portfolio, st)
+                any_restored = True
+
+        # Open positions, per cohort
         for p in await self.store.load_positions():
-            self.positions[p["symbol"]] = Position(
+            pid = p.get("portfolio_id") or "DISTRIBUTED"
+            portfolio = self.portfolios.get(pid)
+            if portfolio is None:
+                continue
+            portfolio.positions[p["symbol"]] = Position(
                 p["symbol"], p["side"], float(p["entry_price"]),
                 float(p["stop_loss"]), float(p["take_profit"]),
                 float(p["size"]), p.get("module") or "unknown",
@@ -355,21 +599,26 @@ class AutonomousEngine:
                 fx_rate=float(p.get("fx_rate") or 1.0),
             )
 
-        # Journal, curve, memory — the dashboard's history
-        self.closed_trades = await self.store.load_trades(limit=1000)
-        self.equity_curve = await self.store.load_equity_curve(limit=500)
+        # Journal + curve, per cohort; memory is shared
+        for pid, portfolio in self.portfolios.items():
+            portfolio.closed_trades = await self.store.load_trades(
+                limit=1000, portfolio_id=pid)
+            portfolio.equity_curve = await self.store.load_equity_curve(
+                limit=500, portfolio_id=pid)
         db_memory = await self.store.load_memory(limit=100)
         if db_memory:
             self.memory = db_memory + self.memory
 
-        # The learning brain reads its own history from the DB
+        # The learning brain reads its own (shared) history from the DB
         await self.brain.stats.load_from_db()
         await self.attribution.load_regime_perf_from_db()
 
-        if st:
+        if any_restored:
             self._mem(
                 f"RESUMED from Postgres: cycle {self.cycle}, "
-                f"equity ${self.equity:.2f} (peak ${self.peak_equity:.2f}), "
+                f"{len(self.portfolios)} cohort(s); primary "
+                f"{self.primary.name} equity ${self.equity:.2f} "
+                f"(peak ${self.peak_equity:.2f}), "
                 f"{len(self.positions)} open positions, "
                 f"{len(self.closed_trades)} journal rows, "
                 f"{len(self.brain.stats.stats)} rule ledgers", "SUCCESS")
@@ -404,7 +653,8 @@ class AutonomousEngine:
                 if self.peak_equity > 0 else 0.0)
             applied["capital"] = cap
             self._mem(f"EDITOR: capital adjusted by ${delta:+.2f} to "
-                      f"${cap:.2f} (equity now ${self.equity:.2f})")
+                      f"${cap:.2f} on cohort {self.primary.name} "
+                      f"(equity now ${self.equity:.2f})")
 
         tgt = _num("target")
         if tgt is not None and tgt > 0 and tgt != self.target_equity:
@@ -602,8 +852,12 @@ class AutonomousEngine:
         except Exception as e:
             self._mem(f"Macro intel unavailable this cycle: {e}", "FAIL")
 
-    def score_asset(self, symbol: str, df: pd.DataFrame,
+    def score_asset(self, portfolio: "Portfolio", symbol: str, df: pd.DataFrame,
                     macro: dict | None = None) -> dict | None:
+        # Scoring runs PER cohort: the technical/indicator/persona maths is
+        # deterministic on the shared candle data, but the cost-aware gate and
+        # the RuleBrain context read THIS cohort's own equity/book, so a setup
+        # can pass for one portfolio and be cost-rejected for another.
         if len(df) < 50:
             return None
         enriched = compute_all(df)
@@ -711,23 +965,24 @@ class AutonomousEngine:
         # correctly rejected; US (~0.06%) and crypto (~0.30%) setups pass.
         market = self.market_of(symbol)
         fx_est = usd_rate(self.currency_of(symbol))
-        planned_notional_usd = self.equity * self.max_position_pct / 100
+        planned_notional_usd = portfolio.equity * self.max_position_pct / 100
         rt_cost_usd = round_trip_cost_usd(market, planned_notional_usd, fx_est)
         rt_cost_pct = round_trip_cost_pct(market, planned_notional_usd, fx_est)
         tp_move_pct = abs(tp - price) / price * 100 if price else 0.0
         cost_floor = COST_EDGE_MULTIPLE * rt_cost_pct
         if tp_move_pct < cost_floor:
             flat_note = "flat-fee " if market == "india" else ""
-            log.info(f"SKIP {symbol}: {flat_note}cost {rt_cost_pct:.2f}% round-trip "
-                     f"at ${planned_notional_usd:.0f} notional exceeds edge — TP move "
-                     f"{tp_move_pct:.2f}% < floor {cost_floor:.2f}% "
+            log.info(f"SKIP {symbol} [{portfolio.id}]: {flat_note}cost {rt_cost_pct:.2f}% "
+                     f"round-trip at ${planned_notional_usd:.0f} notional exceeds edge — "
+                     f"TP move {tp_move_pct:.2f}% < floor {cost_floor:.2f}% "
                      f"({COST_EDGE_MULTIPLE:g}x)")
             self.audit.log_trade_decision(
                 action="SKIP", symbol=symbol,
                 setup={"symbol": symbol, "direction": direction,
                        "current_price": round(price, 2),
                        "take_profit": round(tp, 2), "risk_reward": round(rr, 2)},
-                portfolio_context={"equity": round(self.equity, 4)},
+                portfolio_context={"equity": round(portfolio.equity, 4),
+                                   "portfolio_id": portfolio.id},
                 reasoning=(f"Cost-aware veto ({market}): target {tp_move_pct:.2f}% < "
                            f"{cost_floor:.2f}% floor ({COST_EDGE_MULTIPLE:g}x "
                            f"round-trip {rt_cost_pct:.2f}% at ${planned_notional_usd:.0f})."),
@@ -763,9 +1018,9 @@ class AutonomousEngine:
         }
 
         # ── Consult the RuleBrain: every decision carries rule citations ──
-        ctx = self._rule_context(result)
+        ctx = self._rule_context(portfolio, result)
         verdict = self.brain.evaluate_setup(result, ctx)
-        self._verdicts[symbol] = verdict
+        portfolio._verdicts[symbol] = verdict
         result["rule_citations"] = verdict.citations
         result["rule_failures"] = [c.citation for c in verdict.failed]
         result["rule_score_multiplier"] = verdict.score_multiplier
@@ -775,12 +1030,13 @@ class AutonomousEngine:
             self.audit.log_rule_citations(symbol, "VETO", verdict.citations, verdict.veto_citations)
             self.audit.log_trade_decision(
                 action="REJECT", symbol=symbol, setup=result,
-                portfolio_context={"equity": round(self.equity, 4),
-                                   "drawdown_pct": round(self.drawdown_pct, 4),
-                                   "open_positions": len(self.positions)},
+                portfolio_context={"equity": round(portfolio.equity, 4),
+                                   "drawdown_pct": round(portfolio.drawdown_pct, 4),
+                                   "open_positions": len(portfolio.positions),
+                                   "portfolio_id": portfolio.id},
                 reasoning="IMMUTABLE rule veto: " + " || ".join(verdict.veto_citations),
             )
-            self._mem(f"VETO {symbol}: {verdict.veto_citations[0]}", "FAIL")
+            self._mem(f"VETO {symbol} [{portfolio.id}]: {verdict.veto_citations[0]}", "FAIL")
             return None
 
         # LEARNABLE rules shade the score (weights come from knowledge/rule_stats.json)
@@ -813,8 +1069,9 @@ class AutonomousEngine:
                 # Consensus reversed the setup's sign — the idea dies here.
                 self.audit.log_trade_decision(
                     action="REJECT", symbol=symbol, setup=result,
-                    portfolio_context={"equity": round(self.equity, 4),
-                                       "open_positions": len(self.positions)},
+                    portfolio_context={"equity": round(portfolio.equity, 4),
+                                       "open_positions": len(portfolio.positions),
+                                       "portfolio_id": portfolio.id},
                     reasoning=f"Persona consensus reversed the signal: {synthesis['summary']}",
                 )
                 return None
@@ -825,8 +1082,9 @@ class AutonomousEngine:
 
         return result
 
-    def _rule_context(self, setup: dict) -> dict:
-        """Portfolio/market context handed to the RuleBrain evaluators."""
+    def _rule_context(self, portfolio: "Portfolio", setup: dict) -> dict:
+        """Portfolio/market context handed to the RuleBrain evaluators — read
+        from THIS cohort's own book so each portfolio is judged independently."""
         price = setup["current_price"]
         stop_pct = abs(price - setup["stop_loss"]) / price * 100 if price else 0.0
         # Planned sizing mirrors open_position(): notional capped at max_position_pct,
@@ -835,26 +1093,26 @@ class AutonomousEngine:
         planned_risk_pct = planned_notional_pct * stop_pct / 100.0
 
         gross = 0.0
-        if self.equity > 0:
-            gross = sum(p.entry_price * p.size for p in self.positions.values()) / self.equity * 100
-        closed = [t for t in self.closed_trades if t.get("pnl") is not None]
+        if portfolio.equity > 0:
+            gross = sum(p.entry_price * p.size for p in portfolio.positions.values()) / portfolio.equity * 100
+        closed = [t for t in portfolio.closed_trades if t.get("pnl") is not None]
         last10 = closed[-10:]
         wins10 = sum(1 for t in last10 if (t.get("pnl") or 0) > 0)
-        pos = self.positions.get(setup["symbol"])
+        pos = portfolio.positions.get(setup["symbol"])
 
         return {
-            "equity": self.equity,
-            "drawdown_pct": self.drawdown_pct,
-            "total_return_pct": (self.equity - self.initial_capital) / self.initial_capital * 100,
+            "equity": portfolio.equity,
+            "drawdown_pct": portfolio.drawdown_pct,
+            "total_return_pct": (portfolio.equity - portfolio.initial_capital) / portfolio.initial_capital * 100,
             "gross_exposure_pct": gross,
             "planned_notional_pct": planned_notional_pct,
             "planned_risk_pct": planned_risk_pct,
-            "open_positions": len(self.positions),
+            "open_positions": len(portfolio.positions),
             "max_concurrent": self.max_concurrent,
             "last10_win_rate": wins10 / len(last10) if last10 else None,
             "last10_n": len(last10),
             "existing_position_unrealized": pos.unrealized if pos else None,
-            "module_stats": self.agent_stats.get(setup["module"]),
+            "module_stats": portfolio.agent_stats.get(setup["module"]),
         }
 
     def _update_trailing_stop(self, pos: "Position", price: float) -> bool:
@@ -889,12 +1147,12 @@ class AutonomousEngine:
             return "TRAILING_STOP" if pos.trail_stop >= pos.stop_loss else "STOP_LOSS"
         return "TRAILING_STOP" if pos.trail_stop <= pos.stop_loss else "STOP_LOSS"
 
-    def check_positions(self, datasets: dict[str, pd.DataFrame]):
+    def check_positions(self, portfolio: "Portfolio", datasets: dict[str, pd.DataFrame]):
         """Scout-side SL/TP/trailing check on the freshest candle (wick-accurate
         via high/low). Sentry protects between scans; both pop from the same
         dict so a position can never be double-closed."""
         to_close = []
-        for sym, pos in self.positions.items():
+        for sym, pos in portfolio.positions.items():
             if sym not in datasets:
                 continue
             df = datasets[sym]
@@ -927,10 +1185,11 @@ class AutonomousEngine:
                     to_close.append((sym, pos.take_profit, "TAKE_PROFIT"))
 
         for sym, exit_price, reason in to_close:
-            self._close_position(sym, exit_price, reason)
+            self._close_position(portfolio, sym, exit_price, reason)
 
-    def _close_position(self, symbol: str, exit_price: float, reason: str):
-        pos = self.positions.pop(symbol, None)
+    def _close_position(self, portfolio: "Portfolio", symbol: str,
+                        exit_price: float, reason: str):
+        pos = portfolio.positions.pop(symbol, None)
         if not pos:
             return
 
@@ -948,14 +1207,15 @@ class AutonomousEngine:
         else:
             pnl = (pos.entry_price - exit_price) * pos.size / fx - exit_cost
 
-        self.equity += pnl
-        self.peak_equity = max(self.peak_equity, self.equity)
-        self.drawdown_pct = (self.peak_equity - self.equity) / self.peak_equity * 100
+        portfolio.equity += pnl
+        portfolio.peak_equity = max(portfolio.peak_equity, portfolio.equity)
+        portfolio.drawdown_pct = (portfolio.peak_equity - portfolio.equity) / portfolio.peak_equity * 100
         # Cost bookkeeping (TRUE USD). pnl above is already NET of exit_cost.
-        self.cost_drag_total += exit_cost
+        portfolio.cost_drag_total += exit_cost
 
         trade = {
-            "id": f"T{len(self.closed_trades)+1:04d}",
+            "id": portfolio.next_trade_id(),
+            "portfolio_id": portfolio.id,
             "date": datetime.now(timezone.utc).isoformat(),
             "symbol": symbol, "side": pos.side,
             # entry/exit shown in NATIVE currency; pnl is TRUE USD.
@@ -967,19 +1227,19 @@ class AutonomousEngine:
             "est_round_trip_cost_pct": round(pos.est_round_trip_cost_pct, 3),
             "exit_cost_usd": round(exit_cost, 4),
         }
-        self.closed_trades.append(trade)
+        portfolio.closed_trades.append(trade)
         if self.store.enabled:
-            self.store.fire(self.store.delete_position(symbol))
+            self.store.fire(self.store.delete_position(symbol, portfolio.id))
 
-        # Agent stats
-        stats = self.agent_stats.get(pos.module, {"wins":0,"losses":0,"pnl":0,"trades":0})
+        # Agent stats (this cohort's own module ledger)
+        stats = portfolio.agent_stats.get(pos.module, {"wins":0,"losses":0,"pnl":0,"trades":0})
         stats["trades"] += 1
         stats["pnl"] += pnl
         if pnl > 0:
             stats["wins"] += 1
         else:
             stats["losses"] += 1
-        self.agent_stats[pos.module] = stats
+        portfolio.agent_stats[pos.module] = stats
 
         # Audit — analyst-grade outcome log
         self.audit.log_trade_outcome(
@@ -993,21 +1253,25 @@ class AutonomousEngine:
         # Attribution — decompose P&L (§9.1) and update per-rule win/loss stats.
         # Feed USD-space entry/exit so the headline thesis/timing decomposition
         # matches the TRUE-USD pnl (fx=1.0 for USD assets — unchanged there).
+        # trade_id is namespaced by cohort so peers holding the same symbol keep
+        # independent open-attribution snapshots (the derived regime/rule stats
+        # still feed the ONE shared brain).
         attribution = self.attribution.on_trade_close(
-            trade_id=symbol, exit_price=round(exit_price / fx, 6), exit_reason=reason,
+            trade_id=f"{portfolio.id}::{symbol}",
+            exit_price=round(exit_price / fx, 6), exit_reason=reason,
             pnl=round(pnl, 4), size=pos.size, entry_price=pos.entry_price / fx,
         )
         if attribution:
             self._mem(
-                f"ATTRIBUTION {symbol}: thesis ${attribution.thesis_pnl:+.4f}, "
+                f"ATTRIBUTION {symbol} [{portfolio.id}]: thesis ${attribution.thesis_pnl:+.4f}, "
                 f"execution ${attribution.timing_pnl:+.4f}, regime={attribution.regime}",
                 "info",
             )
 
         # Partners' Room bookkeeping: score each persona's entry vote against
         # the realized outcome (accuracy feeds the PM's vote weights).
-        entry_votes = self._entry_votes.pop(symbol, None)
-        self._position_consensus.pop(symbol, None)
+        entry_votes = portfolio._entry_votes.pop(symbol, None)
+        portfolio._position_consensus.pop(symbol, None)
         if entry_votes:
             self.personas.stats.record_trade_outcome(
                 entry_votes, pos.side, pnl > 0)
@@ -1031,16 +1295,16 @@ class AutonomousEngine:
             fx_note = (f" [{pos.currency} {gross_native:+.2f} pts @ {fx:.2f} "
                        f"{pos.currency}/USD = ${gross_native / fx:+.4f} USD]")
         if pnl > 0:
-            self._mem(f"WIN ${pnl:+.4f} on {symbol} ({reason}).{fx_note} "
+            self._mem(f"WIN ${pnl:+.4f} on {symbol} [{portfolio.id}] ({reason}).{fx_note} "
                       f"{', '.join(pos.reasons[:2])}", "SUCCESS")
         else:
-            self._mem(f"LOSS ${pnl:+.4f} on {symbol} ({reason}).{fx_note} "
+            self._mem(f"LOSS ${pnl:+.4f} on {symbol} [{portfolio.id}] ({reason}).{fx_note} "
                       f"Revisit: {', '.join(pos.reasons[:2])}", "FAIL")
 
-    def open_position(self, setup: dict):
-        if setup["symbol"] in self.positions:
+    def open_position(self, portfolio: "Portfolio", setup: dict):
+        if setup["symbol"] in portfolio.positions:
             return
-        if len(self.positions) >= self.max_concurrent:
+        if len(portfolio.positions) >= self.max_concurrent:
             return
 
         price = setup["current_price"]          # native currency (INR for NSE)
@@ -1059,10 +1323,10 @@ class AutonomousEngine:
         risk_per_unit_u = risk_per_unit / fx
 
         # Size: risk max_position_pct of equity (all USD)
-        risk_amount = self.equity * self.max_position_pct / 100
+        risk_amount = portfolio.equity * self.max_position_pct / 100
         size = risk_amount / risk_per_unit_u
         notional = size * price_u
-        max_notional = self.equity * self.max_position_pct / 100
+        max_notional = portfolio.equity * self.max_position_pct / 100
         if notional > max_notional:
             size = max_notional / price_u
 
@@ -1073,8 +1337,8 @@ class AutonomousEngine:
         entry = price
         notional_usd = size * entry / fx
         entry_cost = order_cost_usd(market, notional_usd, fx)
-        self.equity -= entry_cost
-        self.cost_drag_total += entry_cost
+        portfolio.equity -= entry_cost
+        portfolio.cost_drag_total += entry_cost
         rt_cost_usd = round_trip_cost_usd(market, notional_usd, fx)
         rt_cost_pct = round_trip_cost_pct(market, notional_usd, fx)
 
@@ -1087,10 +1351,11 @@ class AutonomousEngine:
         )
         pos.est_round_trip_cost_usd = round(rt_cost_usd, 4)
         pos.est_round_trip_cost_pct = round(rt_cost_pct, 3)
-        self.positions[setup["symbol"]] = pos
+        portfolio.positions[setup["symbol"]] = pos
 
         open_row = {
-            "id": f"T{len(self.closed_trades)+1:04d}",
+            "id": portfolio.next_trade_id(),
+            "portfolio_id": portfolio.id,
             "date": datetime.now(timezone.utc).isoformat(),
             "symbol": setup["symbol"], "side": setup["direction"],
             "entry": round(entry, 2), "exit": None,
@@ -1100,13 +1365,14 @@ class AutonomousEngine:
             "est_round_trip_cost_usd": round(rt_cost_usd, 4),
             "est_round_trip_cost_pct": round(rt_cost_pct, 3),
         }
-        self.closed_trades.append(open_row)
+        portfolio.closed_trades.append(open_row)
 
         # Persist: open position row, OPEN journal row (with rule citations),
         # and the post-commission equity snapshot.
         if self.store.enabled:
             self.store.fire(self.store.upsert_position(
-                pos.to_dict() | {"reasons": pos.reasons}))
+                pos.to_dict() | {"reasons": pos.reasons,
+                                 "portfolio_id": portfolio.id}))
             db_row = dict(open_row)
             db_row["rule_citations"] = list(setup.get("rule_citations", []))
             # Persona vote breakdown lands in the trades.detail jsonb column.
@@ -1120,10 +1386,10 @@ class AutonomousEngine:
 
         # Remember the partners' verdict for this position: scored at close,
         # shown on the front page's PARTNERS' CONSENSUS column meanwhile.
-        self._entry_votes[setup["symbol"]] = list(setup.get("persona_votes", []))
+        portfolio._entry_votes[setup["symbol"]] = list(setup.get("persona_votes", []))
         cons = setup.get("persona_consensus")
         if cons:
-            self._position_consensus[setup["symbol"]] = dict(cons) | {
+            portfolio._position_consensus[setup["symbol"]] = dict(cons) | {
                 "at": datetime.now(timezone.utc).isoformat()}
             self.audit.log_system_event("PERSONA_CONSENSUS", {
                 "symbol": setup["symbol"], "action": cons.get("action"),
@@ -1135,12 +1401,13 @@ class AutonomousEngine:
         # Notional and risk are booked in TRUE USD (native / fx).
         risk_amount = size * abs(entry - sl) / fx
         portfolio_context = {
-            "equity": round(self.equity, 4),
-            "drawdown_pct": round(self.drawdown_pct, 4),
-            "open_positions": len(self.positions),
+            "portfolio_id": portfolio.id,
+            "equity": round(portfolio.equity, 4),
+            "drawdown_pct": round(portfolio.drawdown_pct, 4),
+            "open_positions": len(portfolio.positions),
             "position_size": round(size * entry / fx, 4),
             "risk_amount": round(risk_amount, 4),
-            "risk_pct": round(risk_amount / self.equity * 100, 2),
+            "risk_pct": round(risk_amount / portfolio.equity * 100, 2),
         }
         citations = setup.get("rule_citations", [])
         self.audit.log_trade_decision(
@@ -1158,24 +1425,26 @@ class AutonomousEngine:
         self.audit.log_rule_citations(setup["symbol"], "OPEN", citations,
                                       setup.get("rule_failures", []))
 
-        # Attribution — store the causal record (§9.1) for close-time decomposition
+        # Attribution — store the causal record (§9.1) for close-time decomposition.
+        # trade_id namespaced by cohort (matches on_trade_close).
         self.attribution.record_entry(
-            trade_id=setup["symbol"], setup=setup,
-            context=portfolio_context | {"equity": self.equity},
-            verdict=self._verdicts.get(setup["symbol"]),
+            trade_id=f"{portfolio.id}::{setup['symbol']}", setup=setup,
+            context=portfolio_context | {"equity": portfolio.equity},
+            verdict=portfolio._verdicts.get(setup["symbol"]),
         )
 
         self._mem(
             f"OPEN {setup['direction']} {setup['symbol']} @ ${entry:.2f} "
-            f"SL=${sl} TP=${setup['take_profit']} ({setup['module']}, score={setup['score']})",
+            f"[{portfolio.id}] SL=${sl} TP=${setup['take_profit']} "
+            f"({setup['module']}, score={setup['score']})",
             "info"
         )
 
-    def _cost_by_market_snapshot(self) -> dict:
+    def _cost_by_market_snapshot(self, portfolio: "Portfolio | None" = None) -> dict:
         """Indicative per-market round-trip cost at the current planned notional
         (max_position_pct of equity). Shows why a small account should favour
         US/crypto over flat-fee-dominated NSE intraday."""
-        notional = self.equity * self.max_position_pct / 100
+        notional = (portfolio or self.primary).equity * self.max_position_pct / 100
         out = {}
         for mkt, cur in (("us", "USD"), ("crypto", "USD"), ("india", "INR")):
             fx = usd_rate(cur)
@@ -1206,7 +1475,12 @@ class AutonomousEngine:
             })
 
         unrealized = sum(p.unrealized for p in self.positions.values())
+        # THE SCOREBOARD — every cohort side by side (winner spotted at a glance).
+        cohorts = [p.summary() for p in self.portfolios.values()]
         state = {
+            "cohorts": cohorts,
+            "cohort_count": len(cohorts),
+            "primary_cohort": self.primary.id,
             "status": ("TARGET_HIT" if self.equity >= self.target_equity
                        else "PAUSED" if self.paused else "RUNNING"),
             "capital": self.initial_capital,
@@ -1285,19 +1559,65 @@ class AutonomousEngine:
         self._last_datasets = datasets  # freshest OHLCV for the held-out metric
         self._mem(f"Loaded {len(datasets)} assets")
 
-        # 2. Check existing positions
-        if self.positions:
-            self.check_positions(datasets)
+        # 2-4. COHORTS: every portfolio sees the SAME shared datasets this
+        # instant, but checks its own book, applies its own market_filter, and
+        # runs its OWN ranking/sizing/cost-gate/risk independently. The primary
+        # (DISTRIBUTED) cohort drives the legacy top-level dashboard panels.
+        primary_scan_results: list[dict] = []
+        for portfolio in self.portfolios.values():
+            if portfolio.positions:
+                self.check_positions(portfolio, datasets)
 
-        # 3. Scan for new setups (news sentiment shades the score, +/-10 pts)
-        setups = []
-        scan_results = []
-        for sym, df in datasets.items():
-            result = self.score_asset(sym, df, macro=self.macro_snapshot)
-            if result:
-                scan_results.append(result)
-                if abs(result["score"]) >= 25 and sym not in self.positions:
-                    setups.append(result)
+            setups = []
+            scan_results = []
+            for sym, df in datasets.items():
+                if not portfolio.allows(self.market_of(sym)):
+                    continue
+                result = self.score_asset(portfolio, sym, df, macro=self.macro_snapshot)
+                if result:
+                    scan_results.append(result)
+                    if abs(result["score"]) >= 25 and sym not in portfolio.positions:
+                        setups.append(result)
+
+            # Rank and execute for THIS cohort
+            if setups and len(portfolio.positions) < self.max_concurrent:
+                ranked = sorted(
+                    setups,
+                    key=lambda x: abs(x["score"]) * x["confidence"] * min(x["risk_reward"], 3),
+                    reverse=True)
+                slots = self.max_concurrent - len(portfolio.positions)
+                for setup in ranked[:slots]:
+                    self.open_position(portfolio, setup)
+                for setup in ranked[slots:]:
+                    self.audit.log_trade_decision(
+                        action="SKIP", symbol=setup["symbol"], setup=setup,
+                        portfolio_context={"equity": portfolio.equity,
+                                           "open_positions": len(portfolio.positions),
+                                           "portfolio_id": portfolio.id},
+                        reasoning=(f"Ranked lower than selected trades. "
+                                   f"Score={setup['score']}, max slots filled."))
+
+            # Per-cohort equity point (drives the SCOREBOARD sparklines)
+            eq_point = {
+                "date": datetime.now(timezone.utc).isoformat(),
+                "equity": round(portfolio.equity, 4),
+                "drawdown_pct": round(portfolio.drawdown_pct, 4),
+                "positions": len(portfolio.positions),
+            }
+            portfolio.equity_curve.append(eq_point)
+            if self.store.enabled:
+                self.store.fire(self.store.log_equity_point(eq_point, portfolio.id))
+
+            self._mem(f"[{portfolio.id}] {len(setups)} actionable of "
+                      f"{len(scan_results)} scanned; {len(portfolio.positions)} open")
+            if portfolio is self.primary:
+                primary_scan_results = scan_results
+
+        # The dashboard's top-level panels mirror the primary cohort's scan.
+        scan_results = primary_scan_results
+        setups = [r for r in scan_results
+                  if abs(r.get("score", 0)) >= 25
+                  and r["symbol"] not in self.primary.positions]
 
         # 3b. Company-level headlines (yfinance, flaky — best effort, cached).
         # Cap at the 15 highest-|score| results to bound cycle time.
@@ -1341,34 +1661,13 @@ class AutonomousEngine:
             "last_updated": datetime.now(timezone.utc).isoformat(),
         }
 
-        # Log all scans to audit
+        # Log the primary cohort's scans to audit (ranking/opening already
+        # happened per-cohort in the loop above).
         for sr in scan_results:
             self.audit.log_scan(sr["symbol"], sr)
 
-        # 4. Rank and execute
-        if setups and len(self.positions) < self.max_concurrent:
-            ranked = sorted(setups, key=lambda x: abs(x["score"]) * x["confidence"] * min(x["risk_reward"], 3), reverse=True)
-            slots = self.max_concurrent - len(self.positions)
-            for setup in ranked[:slots]:
-                self.open_position(setup)
-            # Log skipped setups
-            for setup in ranked[slots:]:
-                self.audit.log_trade_decision(
-                    action="SKIP", symbol=setup["symbol"], setup=setup,
-                    portfolio_context={"equity": self.equity, "open_positions": len(self.positions)},
-                    reasoning=f"Ranked lower than selected trades. Score={setup['score']}, max slots filled.",
-                )
-
-        # 5. Record equity (in-memory + Postgres when configured)
-        eq_point = {
-            "date": datetime.now(timezone.utc).isoformat(),
-            "equity": round(self.equity, 4),
-            "drawdown_pct": round(self.drawdown_pct, 4),
-            "positions": len(self.positions),
-        }
-        self.equity_curve.append(eq_point)
+        # 5. Durable snapshot of every cohort's state (Postgres when configured)
         if self.store.enabled:
-            self.store.fire(self.store.log_equity_point(eq_point))
             self._persist_engine_state()
 
         # 6. Push to dashboard (last_scan anchors the client-side countdown)
@@ -1722,7 +2021,8 @@ class AutonomousEngine:
         nxt = (int(epoch // period) + 1) * period
         return max(1.0, (nxt - epoch) + 2.0)
 
-    def _sentry_manage_position(self, sym: str, pos: "Position", px: float):
+    def _sentry_manage_position(self, portfolio: "Portfolio", sym: str,
+                                pos: "Position", px: float):
         """Mark one position to `px`, ratchet its trailing stop, and close it
         if the effective stop or take-profit is breached."""
         fx = pos.fx_rate or 1.0
@@ -1747,8 +2047,8 @@ class AutonomousEngine:
                 hit = (pos.take_profit, "TAKE_PROFIT")
 
         if hit:
-            log.info(f"SENTRY: {sym} hit {hit[1]} @ {px:.4f} — closing")
-            self._close_position(sym, hit[0], hit[1])
+            log.info(f"SENTRY [{portfolio.id}]: {sym} hit {hit[1]} @ {px:.4f} — closing")
+            self._close_position(portfolio, sym, hit[0], hit[1])
         else:
             if moved:
                 trail_txt = f", trail moved to {pos.trail_stop}"
@@ -1756,29 +2056,36 @@ class AutonomousEngine:
                 trail_txt = f", trail at {pos.trail_stop}"
             else:
                 trail_txt = ""
-            log.info(f"SENTRY: {sym} marked @ {px:.4f}, "
+            log.info(f"SENTRY [{portfolio.id}]: {sym} marked @ {px:.4f}, "
                      f"unrealized {pos.unrealized:+.4f}{trail_txt}")
 
     async def _sentry_tick(self):
-        """One Sentry pass over OPEN positions. Processes closes here so a
-        concurrent Scout scan never double-touches a position (both pop from
-        self.positions; whoever is second finds it already gone)."""
+        """One Sentry pass over OPEN positions across ALL cohorts. Processes
+        closes here so a concurrent Scout scan never double-touches a position
+        (both pop from the same book; whoever is second finds it already gone).
+        Prices are fetched ONCE for the union of symbols and shared across
+        cohorts holding the same asset."""
         self.last_sentry_run = datetime.now(timezone.utc).isoformat()
         ENGINE_STATE["last_sentry_run"] = self.last_sentry_run
         # Heartbeat: proof the Sentry loop is alive, whatever else happens
         ENGINE_STATE["last_heartbeat"] = self.last_sentry_run
         # Only mark positions whose market is open — closed markets don't move.
         hours = market_hours_status()
-        symbols = [s for s in self.positions
-                   if hours.get(self.market_of(s), True)]
+        symbols = sorted({
+            s for portfolio in self.portfolios.values() for s in portfolio.positions
+            if hours.get(self.market_of(s), True)
+        })
         if symbols:
             prices = await asyncio.to_thread(
                 self._fetch_last_prices_sync, symbols)
-            for sym in list(prices.keys()):
-                pos = self.positions.get(sym)
-                if not pos:
-                    continue  # closed elsewhere in the meantime
-                self._sentry_manage_position(sym, pos, prices[sym])
+            for portfolio in self.portfolios.values():
+                for sym in list(portfolio.positions.keys()):
+                    if sym not in prices:
+                        continue
+                    pos = portfolio.positions.get(sym)
+                    if not pos:
+                        continue  # closed elsewhere in the meantime
+                    self._sentry_manage_position(portfolio, sym, pos, prices[sym])
         # Push every tick so the front page stays live between scans.
         await self.push_state()
 
@@ -1837,6 +2144,14 @@ class AutonomousEngine:
             "per_module": [],
         }
         self._mem(f"Engine started. Capital=${self.initial_capital} Target=${self.target_equity}")
+        if len(self.portfolios) > 1 or self.primary.id != "DISTRIBUTED":
+            self._mem(
+                f"COHORT MODE: {len(self.portfolios)} isolated portfolios, "
+                f"each ${INITIAL_CAPITAL:.0f} — "
+                + " | ".join(f"{p.name} ({p.market_label()})"
+                             for p in self.portfolios.values())
+                + f" — shared scan/FinBERT/brain, primary={self.primary.id}",
+                "SUCCESS")
         if self.scan_timeframe == "1d":
             self._mem(f"Scout: daily mode, rescan every {self.scan_interval_minutes} min "
                       f"| Sentry: every {self.sentry_interval_seconds}s "
@@ -1888,7 +2203,8 @@ class AutonomousEngine:
         await self.push_state()
         self._mem("Engine stopped.")
         if self.store.enabled:
-            await self.store.save_engine_state(self._engine_state_row())
+            for p in self.portfolios.values():
+                await self.store.save_engine_state(self._engine_state_row(p))
             await self.store.close()
         await self.crypto.close()
 

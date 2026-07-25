@@ -74,6 +74,10 @@ ENGINE_STATE: dict[str, Any] = {
     },
     "cost_drag_total": 0.0,
     "cost_by_market": {},
+    # THE SCOREBOARD — one entry per cohort (isolated paper portfolio).
+    "cohorts": [],
+    "cohort_count": 0,
+    "primary_cohort": "DISTRIBUTED",
     "cycle_count": 0,
     "last_scan": None,
     "errors": [],
@@ -127,6 +131,16 @@ async def get_state():
 @app.get("/api/trades")
 async def get_trades():
     return ENGINE_STATE.get("trade_journal", [])
+
+
+@app.get("/api/cohorts")
+async def get_cohorts():
+    """THE SCOREBOARD: every isolated paper portfolio side by side."""
+    return {
+        "primary": ENGINE_STATE.get("primary_cohort"),
+        "count": ENGINE_STATE.get("cohort_count", 0),
+        "cohorts": ENGINE_STATE.get("cohorts", []),
+    }
 
 
 @app.get("/api/agents")
