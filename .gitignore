@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Virtual env
+venv/
+.venv/
+
+# Secrets & env
+.env
+.env.*
+*.key
+*.pem
+credentials.json
+
+# Runtime data (regenerates)
+data/storage/**
+!data/storage/.gitkeep
+data/cache/**
+!data/cache/.gitkeep
+*.parquet
+
+# Runtime logs & reports
+logs/
+reports/audit/
+reports/daily/
+reports/simulation/
+reports/live/
+
+# Runtime learned-state (brain regenerates / DB is source of truth)
+knowledge/rule_stats.json
+personas/persona_stats.json
+loops/*.jsonl
+
+# Model caches
+*.safetensors
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db

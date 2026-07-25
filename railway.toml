@@ -1,0 +1,11 @@
+# Railway deployment config — see docs/DEPLOY.md for the full walkthrough.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python autonomous.py"
+healthcheckPath = "/api/state"
+healthcheckTimeout = 300
+restartPolicyType = "always"

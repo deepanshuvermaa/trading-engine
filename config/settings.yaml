@@ -1,0 +1,71 @@
+# Master Configuration — Bitcoin Analyser
+
+engine:
+  name: "macro-trading-engine"
+  mode: "paper"  # paper | live
+  log_level: "INFO"
+  data_dir: "./data/storage"
+  cache_dir: "./data/cache"
+
+markets:
+  crypto:
+    enabled: true
+    exchange: "binance"
+    symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    timeframes: ["1h", "4h", "1d"]
+    lookback_days: 365
+
+  indian_equity:
+    enabled: true
+    symbols: ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"]
+    index: ["NIFTY 50", "NIFTY BANK"]
+    timeframes: ["1d"]
+    lookback_days: 3650  # 10 years
+
+  us_equity:
+    enabled: true
+    symbols: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "SPY", "QQQ"]
+    timeframes: ["1d"]
+    lookback_days: 3650
+
+  forex:
+    enabled: false  # needs OANDA demo account setup
+    symbols: ["EUR/USD", "GBP/USD", "USD/JPY", "USD/INR"]
+    timeframes: ["1h", "4h", "1d"]
+    lookback_days: 1825
+
+risk:
+  max_drawdown_pct: 2.0
+  max_position_pct: 5.0
+  max_portfolio_exposure_pct: 30.0
+  scale_down_factor: 0.5
+  recovery_streak_required: 3
+
+modules:
+  trial_period_days: 30
+  trial_min_sharpe: 0.5
+  trial_max_drawdown_pct: 3.0
+  active_min_sharpe: 0.3
+  probation_days: 7
+  max_trial_failures: 3
+
+loops:
+  inner:
+    experiments_per_cycle: 10
+    backtest_window_days: 730  # 2 years
+    min_sharpe_improvement: 0.05
+  outer:
+    run_interval_hours: 24
+    stagnation_threshold_days: 30
+    experiment_success_rate_min: 0.05
+
+macro:
+  fred_api_key: ""  # set via env FRED_API_KEY
+  gdelt_enabled: true
+  rss_feeds_update_interval_minutes: 60
+  sentiment_model: "ProsusAI/finbert"
+
+api_keys:
+  fred: "${FRED_API_KEY}"
+  reddit_client_id: "${REDDIT_CLIENT_ID}"
+  reddit_client_secret: "${REDDIT_CLIENT_SECRET}"

@@ -1,0 +1,24 @@
+# Local environments / caches
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.hf-cache/
+.git/
+.gitignore
+
+# Local market-data cache and generated reports (rebuilt at runtime)
+data/storage/
+**/*.parquet
+reports/
+
+# Docs and local-only files
+docs/
+*.md
+.dockerignore
+Dockerfile
+railway.toml
+Procfile
