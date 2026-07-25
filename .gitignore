@@ -34,6 +34,14 @@ knowledge/rule_stats.json
 personas/persona_stats.json
 loops/*.jsonl
 
+# .loop runtime experiment records (the daily loop writes these; the seed
+# example + the frozen anchors/scaffold stay tracked)
+.loop/experiments/*.json
+!.loop/experiments/0001-example.json
+# Per-machine anchor baseline — the guard self-records it on first run so
+# CRLF normalization can't false-trigger a tamper across fresh clones.
+.loop/anchors/.hashes.json
+
 # Model caches
 *.safetensors
 .cache/

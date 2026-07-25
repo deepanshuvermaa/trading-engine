@@ -1,0 +1,20 @@
+{
+  "best_known_config": {
+    "scan_timeframe": "15m",
+    "max_position_pct": 10.0,
+    "max_concurrent": 3,
+    "trail_activation_atr": 1.5,
+    "trail_distance_atr": 1.0,
+    "rule_weights_source": "knowledge/rule_stats.json (live attribution)"
+  },
+  "best_metric": null,
+  "best_holdout_sharpe": null,
+  "last_outer_run": null,
+  "open_hypotheses": [
+    "Down-weight learnable rules with live accuracy < 0.40 without regressing held-out Sharpe.",
+    "Confirm the 2% max-drawdown veto is never breached on the most-recent holdout slice.",
+    "Verify cost-aware entry filter improves net-of-cost held-out return by rejecting sub-cost NSE targets."
+  ],
+  "anchors_frozen": true,
+  "notes": "best_metric is the mean out-of-sample walk-forward Sharpe of best_known_config; null until the daily loop scores a config on real holdout data. The loop only overwrites best_* when a config KEEPS (improves holdout Sharpe without a 2% DD veto)."
+}

@@ -53,6 +53,7 @@ from data.models import Signal
 from control.decision_audit import DecisionAudit
 from db.store import get_store
 from knowledge.brain import RuleBrain
+from knowledge.anchor_guard import assert_anchors_untouched, AnchorTamperError
 from loops.attribution import TradeAttribution
 from macro.intelligence import MacroIntelligence
 from personas.engine import PersonaEngine
@@ -1486,6 +1487,36 @@ class AutonomousEngine:
         (:00/:15/:30/:45 for 15m); in daily mode it keeps the old fixed cadence.
         Capital protection runs concurrently in sentry_loop()."""
         ENGINE_STATE["last_heartbeat"] = datetime.now(timezone.utc).isoformat()
+        # Freeze-check the human-owned .loop anchors before anything trades.
+        # A tampered anchor halts the engine — the optimizer may never edit them.
+        try:
+            assert_anchors_untouched()
+            self._anchors_frozen = True
+            self._mem("Anchors verified frozen.", "SUCCESS")
+        except AnchorTamperError as e:
+            self._anchors_frozen = False
+            self._mem(f"ANCHOR TAMPER — halting: {e}", "FAIL")
+            raise
+        # Seed the dashboard loop panel from persisted .loop state before the
+        # first daily cycle fires.
+        _lst = self._load_loop_state()
+        self.loop_best_metric = _lst.get("best_metric")
+        self.loop_holdout_sharpe = _lst.get("best_holdout_sharpe")
+        self.loop_open_hypotheses = _lst.get("open_hypotheses", [])
+        ENGINE_STATE["loop_status"] = {
+            "last_outer_run": self.last_outer_run,
+            "best_metric": self.loop_best_metric,
+            "holdout_sharpe": self.loop_holdout_sharpe,
+            "raw_holdout_sharpe": None,
+            "vetoed": None,
+            "last_verdict": None,
+            "downweighted_rules": [],
+            "open_hypotheses": self.loop_open_hypotheses,
+            "anchors_frozen": self._anchors_frozen,
+            "metric_definition": ("Out-of-sample walk-forward Sharpe "
+                                  "(last 20% holdout) w/ hard 2% max-DD veto"),
+            "per_module": [],
+        }
         self._mem(f"Engine started. Capital=${self.initial_capital} Target=${self.target_equity}")
         if self.scan_timeframe == "1d":
             self._mem(f"Scout: daily mode, rescan every {self.scan_interval_minutes} min "

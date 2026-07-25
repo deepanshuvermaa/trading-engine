@@ -1,0 +1,11 @@
+{
+  "id": "0001-example",
+  "timestamp": "2026-07-25T00:00:00+00:00",
+  "hypothesis": "Down-weighting learnable rules whose live attribution accuracy is below 0.40 will not regress the held-out walk-forward Sharpe (it should remove noise-fitting rules).",
+  "diff_summary": "No parameter change applied. Baseline snapshot: rule weights derived from live rule_stats; down-weight candidates identified via RuleStats.underperformers(0.40). This is the seed/example record showing the schema the daily loop writes.",
+  "metric_before": null,
+  "metric_after": null,
+  "holdout_score": null,
+  "verdict": "SEED",
+  "verifier_notes": "Example record only — no live trades yet, so WalkForwardEvaluator returned no scorable holdout. The daily loop overwrites metric_before/after and holdout_score with real out-of-sample Sharpe once closed trades and fetched holdout data exist. verdict is one of KEEP | REVERT | VETO | SEED. anchors_frozen must be true for any non-SEED record."
+}
