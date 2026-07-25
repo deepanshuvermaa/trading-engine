@@ -766,16 +766,31 @@ table.scoreboard .mkt-chip {
 <div class="wire-toast" id="wireToast"></div>
 
 <script>
-const WS_URL = `ws://${location.host}/ws`;
+// Protocol-aware: wss:// on https pages (browsers block ws:// as mixed content)
+const WS_PROTO = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const WS_URL = `${WS_PROTO}//${location.host}/ws`;
 let ws;
 let state = {};
+let wsLive = false;
 
 function connect() {
-    ws = new WebSocket(WS_URL);
-    ws.onmessage = (e) => { state = JSON.parse(e.data); render(); };
-    ws.onclose = () => setTimeout(connect, 2000);
-    ws.onerror = () => ws.close();
+    try { ws = new WebSocket(WS_URL); } catch (e) { wsLive = false; return; }
+    ws.onopen = () => { wsLive = true; };
+    ws.onmessage = (e) => { wsLive = true; state = JSON.parse(e.data); render(); };
+    ws.onclose = () => { wsLive = false; setTimeout(connect, 2000); };
+    ws.onerror = () => { wsLive = false; try { ws.close(); } catch (e) {} };
 }
+
+// Always-on poll: guarantees liveness even if the WebSocket never opens.
+// Fetches immediately on load, then every 4s regardless of WS state.
+function pollState() {
+    fetch('/api/state', {cache: 'no-store'})
+        .then(r => r.json())
+        .then(d => { state = d; render(); })
+        .catch(() => {});
+}
+pollState();
+setInterval(pollState, 4000);
 
 function esc(s) {
     return String(s == null ? '' : s)
@@ -1995,13 +2010,7 @@ function tickCountdown() {
 setInterval(() => { tickCountdown(); renderHeartbeat(); }, 1000);
 
 connect();
-render();  // paint the empty-state front page immediately
-// Fallback poll if WebSocket fails
-setInterval(() => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-        fetch('/api/state').then(r=>r.json()).then(d => { state = d; render(); }).catch(()=>{});
-    }
-}, 5000);
+render();  // paint the empty-state front page immediately (poll overwrites it)
 </script>
 </body>
 </html>
