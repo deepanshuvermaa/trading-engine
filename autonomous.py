@@ -236,6 +236,15 @@ class AutonomousEngine:
         self.equity = INITIAL_CAPITAL
         self.peak_equity = INITIAL_CAPITAL
         self.drawdown_pct = 0.0
+        self.cost_drag_total = 0.0  # cumulative commissions + slippage paid (USD)
+
+        # ── The daily improvement loop (Karpathy keep-or-revert) ──
+        self._anchors_frozen = True
+        self.last_outer_run: str | None = None      # ISO ts of last daily loop
+        self._last_datasets: dict[str, pd.DataFrame] = {}  # freshest OHLCV for holdout
+        self.loop_best_metric: float | None = None
+        self.loop_holdout_sharpe: float | None = None
+        self.loop_open_hypotheses: list[str] = []
         self.positions: dict[str, Position] = {}
         self.closed_trades: list[dict] = []
         self.equity_curve: list[dict] = []
@@ -283,6 +292,8 @@ class AutonomousEngine:
                 "trail_activation_atr": self.trail_activation_atr,
                 "trail_distance_atr": self.trail_distance_atr,
                 "paused": self.paused,
+                "cost_drag_total": self.cost_drag_total,
+                "last_outer_run": self.last_outer_run,
                 "agent_stats": self.agent_stats,
             },
         }
@@ -325,6 +336,9 @@ class AutonomousEngine:
                 params.get("trail_activation_atr", self.trail_activation_atr))
             self.trail_distance_atr = float(
                 params.get("trail_distance_atr", self.trail_distance_atr))
+            self.cost_drag_total = float(
+                params.get("cost_drag_total", self.cost_drag_total))
+            self.last_outer_run = params.get("last_outer_run", self.last_outer_run)
             saved_agents = params.get("agent_stats") or {}
             for name, stats in saved_agents.items():
                 self.agent_stats[name] = stats
@@ -1234,6 +1248,15 @@ class AutonomousEngine:
             "memory_log": self.memory[-100:],
             "logs": get_recent_logs(50),
             "last_heartbeat": ENGINE_STATE.get("last_heartbeat"),
+            "loop_status": ENGINE_STATE.get("loop_status", {
+                "last_outer_run": self.last_outer_run,
+                "best_metric": self.loop_best_metric,
+                "holdout_sharpe": self.loop_holdout_sharpe,
+                "open_hypotheses": self.loop_open_hypotheses,
+                "anchors_frozen": self._anchors_frozen,
+                "metric_definition": ("Out-of-sample walk-forward Sharpe "
+                                      "(last 20% holdout) w/ hard 2% max-DD veto"),
+            }),
             "cycle_count": self.cycle,
             "last_scan": self.last_scan_at,
             "as_of": datetime.now(timezone.utc).isoformat(),
@@ -1259,6 +1282,7 @@ class AutonomousEngine:
                       f"{', '.join(_open)})")
         await self.refresh_macro_intel()  # 30-min cached
         datasets = await self.fetch_universe()
+        self._last_datasets = datasets  # freshest OHLCV for the held-out metric
         self._mem(f"Loaded {len(datasets)} assets")
 
         # 2. Check existing positions
@@ -1351,10 +1375,305 @@ class AutonomousEngine:
         self.last_scan_at = datetime.now(timezone.utc).isoformat()
         await self.push_state()
 
+        # 6b. The daily improvement loop — keep-or-revert against the confirmed
+        # held-out metric, at most once per 24h of wall-clock.
+        if self._daily_loop_due():
+            try:
+                await self.run_daily_outer_loop()
+            except Exception as e:
+                self._mem(f"Daily loop error: {e}", "FAIL")
+                log.error(traceback.format_exc())
+
         # 7. Check target
         if self.equity >= self.target_equity:
             self._mem(f"TARGET HIT! Equity ${self.equity:.2f} >= ${self.target_equity:.2f}", "SUCCESS")
             self.running = False
+
+    # ── The daily improvement loop (Karpathy keep-or-revert) ────────
+
+    def _daily_loop_due(self) -> bool:
+        """True if >= 24h of wall-clock has passed since the last outer run."""
+        if not self.last_outer_run:
+            return True
+        try:
+            last = datetime.fromisoformat(self.last_outer_run)
+        except (TypeError, ValueError):
+            return True
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - last) >= timedelta(hours=24)
+
+    def _loop_config_snapshot(self) -> dict:
+        """The current live-tunable configuration (what a 'config' means here)."""
+        return {
+            "scan_timeframe": self.scan_timeframe,
+            "max_position_pct": self.max_position_pct,
+            "max_concurrent": self.max_concurrent,
+            "trail_activation_atr": self.trail_activation_atr,
+            "trail_distance_atr": self.trail_distance_atr,
+            "rule_weights_source": "knowledge/rule_stats.json (live attribution)",
+            "learnable_rule_weights": self.brain.stats.snapshot().get("rules", []),
+        }
+
+    async def score_holdout_metric(self) -> dict:
+        """Score the current config on the CONFIRMED metric: out-of-sample
+        walk-forward Sharpe (last 20% holdout) with the 2% max-DD veto.
+
+        Returns a dict; `holdout_sharpe` is None when the veto fires or there is
+        no scorable held-out data. `raw_holdout_sharpe` is the mean Sharpe for
+        display even when vetoed."""
+        from strategy.modules import ALL_MODULES
+        from backtest.engine import BacktestEngine, WalkForwardEvaluator
+
+        datasets = self._last_datasets or {}
+        if not datasets:
+            return {"scorable": False, "reason": "no datasets fetched yet",
+                    "holdout_sharpe": None, "raw_holdout_sharpe": None,
+                    "vetoed": False, "per_module": [],
+                    "assets_evaluated": 0, "total_holdout_trades": 0}
+
+        ev = WalkForwardEvaluator(
+            BacktestEngine(risk_config=self.settings.risk,
+                           initial_capital=100_000.0),
+            holdout_pct=0.20,
+            max_drawdown_pct=self.settings.risk.max_drawdown_pct,
+        )
+        # Cap assets for bounded runtime (daily cadence, but stay responsive).
+        items = dict(list(datasets.items())[:15])
+
+        per_module, ok_sharpes, all_sharpes = [], [], []
+        vetoed_any = False
+        scored = 0
+        trades = 0
+        for ModuleCls in ALL_MODULES:
+            module = ModuleCls()
+            s = ev.score(module, items)  # raw score (surfaces Sharpe even on veto)
+            if s is None:
+                per_module.append({"module": module.name, "scorable": False})
+                continue
+            scored += 1
+            trades += s.total_trades
+            all_sharpes.append(s.holdout_sharpe)
+            if s.vetoed:
+                vetoed_any = True
+            else:
+                ok_sharpes.append(s.holdout_sharpe)
+            per_module.append({
+                "module": module.name,
+                "holdout_sharpe": s.holdout_sharpe,
+                "max_dd_pct": s.holdout_max_dd_pct,
+                "return_pct": s.holdout_return_pct,
+                "trades": s.total_trades,
+                "assets": s.assets_scored,
+                "vetoed": s.vetoed,
+            })
+
+        raw = round(sum(all_sharpes) / len(all_sharpes), 4) if all_sharpes else None
+        if scored == 0:
+            agg, reason = None, "no scorable held-out data"
+        elif vetoed_any:
+            agg, reason = None, "2% max-drawdown veto breached on holdout"
+        else:
+            agg = round(sum(ok_sharpes) / len(ok_sharpes), 4) if ok_sharpes else None
+            reason = "ok"
+        return {"scorable": scored > 0, "reason": reason,
+                "holdout_sharpe": agg, "raw_holdout_sharpe": raw,
+                "vetoed": vetoed_any, "per_module": per_module,
+                "assets_evaluated": len(items), "total_holdout_trades": trades}
+
+    @staticmethod
+    def _decide_verdict(before, after, vetoed: bool, scorable: bool):
+        """Karpathy keep-or-revert against the REAL held-out metric."""
+        if vetoed:
+            return "VETO", ("Held-out 2% max-drawdown veto breached — config "
+                            "rejected on unseen data.")
+        if not scorable or after is None:
+            return "SEED", ("No scorable held-out data yet — baseline recorded, "
+                            "no keep/revert.")
+        if before is None:
+            return "KEEP", "First real held-out measurement — recorded as best."
+        if after >= before - 1e-4:
+            return "KEEP", "Held-out Sharpe did not regress — configuration kept."
+        return "REVERT", ("Held-out Sharpe regressed vs best — configuration "
+                          "flagged for revert (overfit signature).")
+
+    def _load_loop_state(self) -> dict:
+        try:
+            return json.loads((LOOP_DIR / "state.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_loop_state(self, st: dict) -> None:
+        (LOOP_DIR).mkdir(parents=True, exist_ok=True)
+        (LOOP_DIR / "state.json").write_text(
+            json.dumps(st, indent=2), encoding="utf-8")
+
+    def _next_experiment_id(self) -> str:
+        d = LOOP_DIR / "experiments"
+        d.mkdir(parents=True, exist_ok=True)
+        nums = []
+        for f in d.glob("*.json"):
+            try:
+                nums.append(int(f.name.split("-")[0]))
+            except (ValueError, IndexError):
+                pass
+        n = (max(nums) + 1) if nums else 1
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return f"{n:04d}-{stamp}"
+
+    def _write_experiment(self, record: dict) -> None:
+        d = LOOP_DIR / "experiments"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{record['id']}.json").write_text(
+            json.dumps(record, indent=2), encoding="utf-8")
+
+    def _append_lesson(self, exp_id, verdict, before, after, downweighted, vetoed):
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        ids = ",".join(d["rule_id"] for d in downweighted) or "none"
+        if vetoed:
+            line = (f"- {day} [{exp_id}] current config -> held-out 2% max-DD "
+                    f"VETO -> do not ship; find which module breached DD on the "
+                    f"unseen slice before re-scoring.")
+        else:
+            line = (f"- {day} [{exp_id}] live-weighted config -> held-out Sharpe "
+                    f"{after} < best {before} (REVERT); down-weighted {ids} -> a "
+                    f"further cut here regressed unseen Sharpe, don't chase it.")
+        try:
+            with open(LOOP_DIR / "lessons.md", "a", encoding="utf-8") as f:
+                f.write("\n" + line)
+        except OSError as e:
+            log.warning(f"could not append lesson: {e}")
+
+    def _update_loop_status_state(self, score: dict, verdict: str, downweighted: list):
+        ENGINE_STATE["loop_status"] = {
+            "last_outer_run": self.last_outer_run,
+            "best_metric": self.loop_best_metric,
+            "holdout_sharpe": score.get("holdout_sharpe"),
+            "raw_holdout_sharpe": score.get("raw_holdout_sharpe"),
+            "vetoed": score.get("vetoed"),
+            "last_verdict": verdict,
+            "downweighted_rules": [d["rule_id"] for d in downweighted],
+            "open_hypotheses": self.loop_open_hypotheses,
+            "anchors_frozen": self._anchors_frozen,
+            "metric_definition": ("Out-of-sample walk-forward Sharpe "
+                                  "(last 20% holdout) w/ hard 2% max-DD veto"),
+            "per_module": score.get("per_module", []),
+            "assets_evaluated": score.get("assets_evaluated", 0),
+            "holdout_trades": score.get("total_holdout_trades", 0),
+        }
+
+    async def run_daily_outer_loop(self, force: bool = False) -> dict:
+        """The daily Karpathy keep-or-revert against the REAL metric on FRESH
+        held-out data. Reads LIVE attribution + rule_stats, scores the current
+        config on the held-out walk-forward Sharpe (2% DD veto), down-weights
+        weak LEARNABLE rules, NEVER touches anchors, and records the outcome."""
+        if not force and not self._daily_loop_due():
+            return {"ran": False, "reason": "not due"}
+
+        # (d) NEVER touch anchors — verify frozen before doing anything.
+        try:
+            assert_anchors_untouched()
+            self._anchors_frozen = True
+            self._mem("Anchors verified frozen.", "SUCCESS")
+        except AnchorTamperError as e:
+            self._anchors_frozen = False
+            self._mem(f"Daily loop ABORTED — anchor tamper: {e}", "FAIL")
+            raise
+
+        now = datetime.now(timezone.utc).isoformat()
+        self._mem("DAILY LOOP: scoring live config against the held-out "
+                  "walk-forward Sharpe (2% DD veto)...")
+
+        # (a) LIVE closed-trade attribution + rule_stats (reload file writes).
+        self.brain.stats._load()
+        weak = self.brain.stats.underperformers(accuracy_below=0.4)
+        closed = [t for t in self.closed_trades if t.get("pnl") is not None]
+
+        # (b) score current config on the confirmed held-out metric.
+        score = await self.score_holdout_metric()
+        metric_after = score["holdout_sharpe"]  # None on veto / no data
+        vetoed = score["vetoed"]
+
+        # (c) down-weight LEARNABLE rules hurting the metric. Their weights are
+        # already derived from live accuracy in RuleStats (< 1.0 when wrong),
+        # which feeds RuleBrain's score_multiplier — this records/audits it.
+        downweighted = [
+            {"rule_id": w["rule_id"], "investor": w["investor"],
+             "accuracy": w["accuracy"], "samples": w["samples"],
+             "weight": w["weight"]}
+            for w in weak
+        ]
+        for w in weak:
+            self._mem(f"LOOP down-weight LEARNABLE {w['rule_id']} "
+                      f"({w['investor']}): acc {w['accuracy']:.0%} over "
+                      f"{w['samples']} trades -> weight {w['weight']}")
+
+        # (e) keep-or-revert vs the best-known held-out metric in state.json.
+        st = self._load_loop_state()
+        metric_before = st.get("best_metric")
+        verdict, note = self._decide_verdict(
+            metric_before, metric_after, vetoed, score["scorable"])
+
+        snapshot = self._loop_config_snapshot()
+        exp_id = self._next_experiment_id()
+        record = {
+            "id": exp_id,
+            "timestamp": now,
+            "hypothesis": ("Live rule weights (from attribution) + current params "
+                           "maximize held-out walk-forward Sharpe without breaching "
+                           "the 2% max-drawdown veto."),
+            "diff_summary": (f"{len(downweighted)} LEARNABLE rules down-weighted "
+                             f"from live attribution; params unchanged. "
+                             f"timeframe={snapshot['scan_timeframe']}, "
+                             f"max_pos_pct={snapshot['max_position_pct']}, "
+                             f"max_concurrent={snapshot['max_concurrent']}."),
+            "metric_before": metric_before,
+            "metric_after": metric_after,
+            "holdout_score": metric_after,
+            "verdict": verdict,
+            "verifier_notes": (
+                f"{note} | reason={score['reason']} "
+                f"assets={score['assets_evaluated']} "
+                f"holdout_trades={score['total_holdout_trades']} "
+                f"live_closed={len(closed)} "
+                f"raw_holdout_sharpe={score['raw_holdout_sharpe']} "
+                f"downweighted={[d['rule_id'] for d in downweighted]}"),
+            "anchors_frozen": self._anchors_frozen,
+            "per_module": score["per_module"],
+        }
+        self._write_experiment(record)
+
+        # Update state.json (best_* only advance on KEEP) + lessons on regress.
+        if verdict == "KEEP":
+            st["best_metric"] = metric_after
+            st["best_holdout_sharpe"] = metric_after
+            st["best_known_config"] = snapshot
+        st["last_outer_run"] = now
+        st["anchors_frozen"] = self._anchors_frozen
+        st.setdefault("open_hypotheses", [])
+        self._save_loop_state(st)
+        if verdict in ("REVERT", "VETO"):
+            self._append_lesson(exp_id, verdict, metric_before, metric_after,
+                                downweighted, vetoed)
+
+        # Reflect on the engine + dashboard.
+        self.last_outer_run = now
+        self.loop_best_metric = st.get("best_metric")
+        self.loop_holdout_sharpe = score.get("raw_holdout_sharpe")
+        self.loop_open_hypotheses = st.get("open_hypotheses", [])
+        self._persist_engine_state()
+
+        # (f) clear summary.
+        self._mem(
+            f"DAILY LOOP [{verdict}]: held-out Sharpe before={metric_before} "
+            f"after={metric_after} (veto={vetoed}); {len(downweighted)} learnable "
+            f"rules down-weighted; {len(closed)} live closed trades. {note}",
+            "SUCCESS" if verdict == "KEEP" else "info")
+        self._update_loop_status_state(score, verdict, downweighted)
+        await self.push_state()
+        return {"ran": True, "verdict": verdict, "metric_before": metric_before,
+                "metric_after": metric_after, "vetoed": vetoed,
+                "downweighted": len(downweighted)}
 
     # ── Inter-cycle price ticker ────────────────────────────────────
 

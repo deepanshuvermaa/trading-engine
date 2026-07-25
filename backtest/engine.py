@@ -257,3 +257,104 @@ class BacktestEngine:
             results.append(result)
 
         return results
+
+
+@dataclass
+class WalkForwardScore:
+    """The confirmed metric's output for one module across a set of assets.
+
+    `vetoed=True` means the 2% max-drawdown gate was breached on the held-out
+    data — treated as an automatic FAIL (None) by `evaluate()`.
+    """
+    holdout_sharpe: float
+    holdout_max_dd_pct: float
+    holdout_return_pct: float
+    total_trades: int
+    assets_scored: int
+    vetoed: bool
+
+
+class WalkForwardEvaluator:
+    """The CONFIRMED metric — Sharpe on the held-out UNSEEN period, gated by the
+    2% max-drawdown veto (see .loop/anchors/metrics.md + holdout.md).
+
+    Holds out the chronologically LAST `holdout_pct` of each asset's history (the
+    most-recent, never-tuned-on slice), runs the immutable BacktestEngine on it,
+    aggregates Sharpe across assets, and FAILS (returns None) if the aggregate
+    held-out max drawdown breaches `max_drawdown_pct`.
+    """
+
+    def __init__(
+        self,
+        engine: "BacktestEngine | None" = None,
+        holdout_pct: float = 0.20,
+        max_drawdown_pct: float = 2.0,
+        min_bars: int = 60,
+        min_holdout_bars: int = 30,
+    ):
+        self.engine = engine or BacktestEngine()
+        self.holdout_pct = holdout_pct
+        self.max_drawdown_pct = max_drawdown_pct
+        self.min_bars = min_bars
+        self.min_holdout_bars = min_holdout_bars
+
+    def _holdout(self, df: pd.DataFrame) -> pd.DataFrame | None:
+        if df is None or len(df) < self.min_bars:
+            return None
+        split = int(len(df) * (1.0 - self.holdout_pct))
+        hold = df.iloc[split:]
+        return hold if len(hold) >= self.min_holdout_bars else None
+
+    def score(
+        self,
+        module: StrategyModule,
+        datasets: dict[str, pd.DataFrame],
+    ) -> WalkForwardScore | None:
+        """Aggregate held-out score for one module. None if no scorable data."""
+        results: list[BacktestResult] = []
+        for symbol, df in datasets.items():
+            hold = self._holdout(df)
+            if hold is None:
+                continue
+            res = self.engine.run(module, hold, symbol)
+            if res.total_trades > 0:
+                results.append(res)
+
+        if not results:
+            return None
+
+        sharpes = [r.sharpe_ratio for r in results]
+        dds = [abs(r.max_drawdown_pct) for r in results]
+        rets = [r.total_return_pct for r in results]
+        trades = sum(r.total_trades for r in results)
+
+        holdout_sharpe = float(np.mean(sharpes))
+        holdout_max_dd = float(max(dds)) if dds else 0.0
+        vetoed = holdout_max_dd > self.max_drawdown_pct
+        return WalkForwardScore(
+            holdout_sharpe=round(holdout_sharpe, 4),
+            holdout_max_dd_pct=round(holdout_max_dd, 4),
+            holdout_return_pct=round(float(np.mean(rets)), 4),
+            total_trades=trades,
+            assets_scored=len(results),
+            vetoed=vetoed,
+        )
+
+    def evaluate(
+        self,
+        module: StrategyModule,
+        datasets: dict[str, pd.DataFrame],
+    ) -> WalkForwardScore | None:
+        """The confirmed-metric gate: returns the score, or **None** if the 2%
+        max-drawdown veto is breached on the holdout (or no scorable data)."""
+        s = self.score(module, datasets)
+        if s is None:
+            return None
+        if s.vetoed:
+            log.warning(
+                f"WalkForward VETO: {module.name} held-out max DD "
+                f"{s.holdout_max_dd_pct:.2f}% > {self.max_drawdown_pct:.2f}% — "
+                f"metric fails (None). (Sharpe would have been {s.holdout_sharpe:.3f})"
+            )
+            return None
+        return s

@@ -390,6 +390,23 @@ canvas { width:100%; height:100%; display:block; }
     font-size:11px; font-style:italic; color:var(--ink-faded); text-align:center;
 }
 
+/* ── THE IMPROVEMENT LOOP panel ─────────────────────────────── */
+.loop-box { border:2px solid var(--ink); background:rgba(255,255,255,.30); padding:8px 10px; }
+.loop-grid { display:grid; grid-template-columns:1fr 1fr; gap:4px 12px; }
+.loop-cell { display:flex; justify-content:space-between; align-items:baseline;
+    border-bottom:1px dotted var(--rule); padding:2px 0; gap:8px; }
+.loop-label { font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--ink-light); }
+.loop-val { font-weight:700; font-size:13px; color:var(--ink); text-align:right; }
+.loop-val.frozen { color:var(--bull); }
+.loop-val.tamper { color:var(--bear); }
+.loop-val.keep { color:var(--bull); }
+.loop-val.revert, .loop-val.veto { color:var(--bear); }
+.loop-metric { margin-top:6px; font-size:10px; font-style:italic; color:var(--ink-faded); border-top:1px solid var(--rule); padding-top:4px; }
+.loop-hyp { margin-top:4px; font-size:10px; color:var(--ink-faded); }
+.loop-hyp ul { margin:2px 0 0 14px; padding:0; }
+.loop-hyp li { margin:1px 0; }
+@media(max-width:720px) { .loop-grid { grid-template-columns:1fr; } }
+
 @media(max-width:1100px) { .page { grid-template-columns:1fr 1fr; } .masthead h1 { font-size:40px; } }
 @media(max-width:720px) {
     .page { grid-template-columns:1fr; } .col { border-left:none; padding:0; }
@@ -449,6 +466,23 @@ canvas { width:100%; height:100%; display:block; }
                 <p>Nothing has been bought or sold yet. When the engine takes its first
                 position, this column will explain, in plain language, what it bought,
                 why it bought it, and which of the house's investing rules signed off.</p>
+            </div>
+        </section>
+
+        <section id="loopSection">
+            <div class="sec-head">The Improvement Loop</div>
+            <div class="sec-sub">The house's self-review. Every 24 hours the engine re-scores its current playbook against the confirmed metric &mdash; risk-adjusted return (Sharpe) on the most-recent UNSEEN period &mdash; with a hard 2% drawdown veto. It may down-weight rules that keep being wrong, but it may NEVER touch the frozen anchors.</div>
+            <div class="loop-box" id="loopBox">
+                <div class="loop-grid">
+                    <div class="loop-cell"><span class="loop-label">Best Metric (held-out Sharpe)</span><span class="loop-val" id="loopBest">&mdash;</span></div>
+                    <div class="loop-cell"><span class="loop-label">Latest Holdout Sharpe</span><span class="loop-val" id="loopHoldout">&mdash;</span></div>
+                    <div class="loop-cell"><span class="loop-label">Last Verdict</span><span class="loop-val" id="loopVerdict">&mdash;</span></div>
+                    <div class="loop-cell"><span class="loop-label">Last Run</span><span class="loop-val" id="loopLastRun">never</span></div>
+                    <div class="loop-cell"><span class="loop-label">Anchors</span><span class="loop-val" id="loopAnchors">&mdash;</span></div>
+                    <div class="loop-cell"><span class="loop-label">Down-weighted Rules</span><span class="loop-val" id="loopDownweighted">&mdash;</span></div>
+                </div>
+                <div class="loop-metric" id="loopMetricDef">Metric: out-of-sample walk-forward Sharpe (last 20% holdout) with a hard 2% max-drawdown veto.</div>
+                <div class="loop-hyp" id="loopHypotheses"></div>
             </div>
         </section>
 
@@ -524,6 +558,7 @@ canvas { width:100%; height:100%; display:block; }
                 <div class="metric"><span class="label">Return</span><span class="value" id="returnPct">0.00%</span></div>
                 <div class="metric"><span class="label">Worst Slip (drawdown)</span><span class="value" id="drawdown">0.00%</span></div>
                 <div class="metric"><span class="label">High-Water Mark</span><span class="value" id="peak">$100.00</span></div>
+                <div class="metric"><span class="label">Cost Paid (fees+slip)</span><span class="value" id="costDrag">$0.00</span></div>
                 <div class="metric"><span class="label">Still To Go</span><span class="value" id="remaining">$20.00</span></div>
                 <div class="metric"><span class="label">Editions Printed (cycles)</span><span class="value" id="cycles">0</span></div>
                 <div class="progress-container">
@@ -764,6 +799,8 @@ function render() {
     ddEl.textContent = `${dd.toFixed(2)}%`;
     ddEl.className = `value ${dd > 1.5 ? 'down' : ''}`;
     document.getElementById('peak').textContent = fmt$(state.peak_equity || cap);
+    const cd = document.getElementById('costDrag');
+    if (cd) cd.textContent = fmt$(state.cost_drag_total || 0);
     document.getElementById('remaining').textContent = fmt$(Math.max(0, target - eq));
     document.getElementById('cycles').textContent = state.cycle_count || 0;
 
@@ -773,6 +810,7 @@ function render() {
 
     renderCoverage(state.universe || {});
     renderTicker();
+    renderLoop();
     renderLead();
     drawEquityChart(state.equity_curve || []);
     renderAgents(state.agent_kpis || []);
@@ -794,6 +832,42 @@ function render() {
         pauseBtn.textContent = state.paused ? 'Resume the Presses' : 'Pause the Presses';
     }
     tickCountdown();
+}
+
+/* ── THE IMPROVEMENT LOOP panel ───────────────────────────── */
+function renderLoop() {
+    const ls = state.loop_status || {};
+    const num = (v) => (v === null || v === undefined) ? '—' : (typeof v === 'number' ? v.toFixed(3) : esc(String(v)));
+
+    document.getElementById('loopBest').textContent = num(ls.best_metric);
+    const hs = (ls.holdout_sharpe !== null && ls.holdout_sharpe !== undefined)
+        ? ls.holdout_sharpe : ls.raw_holdout_sharpe;
+    document.getElementById('loopHoldout').textContent =
+        num(hs) + (ls.vetoed ? ' (VETOED)' : '');
+
+    const v = document.getElementById('loopVerdict');
+    v.textContent = ls.last_verdict || '—';
+    v.className = 'loop-val ' + (ls.last_verdict ? String(ls.last_verdict).toLowerCase() : '');
+
+    document.getElementById('loopLastRun').textContent =
+        ls.last_outer_run ? `${istDateTime(ls.last_outer_run)} IST` : 'never';
+
+    const a = document.getElementById('loopAnchors');
+    const frozen = ls.anchors_frozen !== false;
+    a.textContent = frozen ? '● FROZEN' : '⚠ TAMPERED';
+    a.className = 'loop-val ' + (frozen ? 'frozen' : 'tamper');
+
+    const dw = ls.downweighted_rules || [];
+    document.getElementById('loopDownweighted').textContent =
+        dw.length ? `${dw.length}: ${dw.slice(0,6).join(', ')}` : 'none';
+
+    if (ls.metric_definition)
+        document.getElementById('loopMetricDef').textContent = 'Metric: ' + esc(ls.metric_definition);
+
+    const hyp = ls.open_hypotheses || [];
+    document.getElementById('loopHypotheses').innerHTML = hyp.length
+        ? 'Open hypotheses:<ul>' + hyp.slice(0,4).map(h => `<li>${esc(h)}</li>`).join('') + '</ul>'
+        : '';
 }
 
 /* ── MARKET COVERAGE line ─────────────────────────────────── */
