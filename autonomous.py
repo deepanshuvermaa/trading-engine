@@ -40,6 +40,10 @@ from dashboard.server import (
 from data.ingestion.crypto import CryptoProvider
 from data.ingestion.us_equity import USEquityProvider
 from data.ingestion.indian_equity import IndianEquityProvider
+from data.fx import to_usd, usd_rate, rate_source
+from data.costs import (
+    order_cost_usd, round_trip_cost_usd, round_trip_cost_pct, cost_breakdown,
+)
 from indicators.technical import compute_all
 from indicators.structural import (
     support_resistance_levels, market_structure_break,
@@ -83,8 +87,16 @@ TARGET_EQUITY = _env_float("TARGET_EQUITY", 120.0)
 SCAN_INTERVAL_MINUTES = _env_int("SCAN_INTERVAL_MINUTES", 30)  # Daily-mode rescan cadence
 MAX_POSITION_PCT = 10.0
 MAX_CONCURRENT = 3
-COMMISSION_PCT = 0.1
-SLIPPAGE_PCT = 0.05
+# Legacy flat-cost knobs (kept for backward compat / crypto defaults live in
+# data/costs.py now). Actual P&L + the entry filter use the PER-MARKET model.
+COMMISSION_PCT = _env_float("COMMISSION_PCT", 0.1)   # per side, % of notional
+SLIPPAGE_PCT = _env_float("SLIPPAGE_PCT", 0.05)      # per fill, % of price
+# A setup's target must clear the (per-market) round-trip cost drag by this
+# multiple or the trade is skipped — no point entering when fees eat the edge.
+COST_EDGE_MULTIPLE = _env_float("COST_EDGE_MULTIPLE", 3.0)
+
+# The self-improvement substrate (frozen anchors, experiments, state, lessons).
+LOOP_DIR = Path(__file__).parent / ".loop"
 DASHBOARD_PORT = _env_int("PORT", 8050)  # Railway injects PORT
 # Memory safety valve for small cloud plans: SKIP_FINBERT=1 forces neutral
 # sentiment so torch/transformers weights are never loaded (~1.5 GB saved).
@@ -131,9 +143,13 @@ def market_hours_status(now: datetime | None = None) -> dict:
 
 class Position:
     def __init__(self, symbol, side, entry, sl, tp, size, module, opened_at,
-                 reasons, atr=0.0, trail_stop=None):
+                 reasons, atr=0.0, trail_stop=None, currency="USD", fx_rate=1.0):
         self.symbol = symbol
         self.side = side
+        # Prices are stored in the asset's NATIVE currency (INR for NSE, USD
+        # elsewhere) so all stop/target/trailing comparisons stay native-to-
+        # native and unchanged. Money flows (unrealized/realized P&L, notional,
+        # commission) are converted to true USD via fx_rate at booking time.
         self.entry_price = entry
         self.stop_loss = sl
         self.take_profit = tp
@@ -141,10 +157,17 @@ class Position:
         self.module = module
         self.opened_at = opened_at
         self.reasons = reasons
-        self.unrealized = 0.0
+        self.unrealized = 0.0  # always TRUE USD
         # Trailing-stop state (Sentry ratchets this as price runs in favour).
         self.atr = float(atr or 0.0)
         self.trail_stop = trail_stop  # None until activation threshold is hit
+        # Currency of the native price + native-units-per-USD at entry. USD
+        # assets carry ("USD", 1.0) so their behaviour is byte-for-byte unchanged.
+        self.currency = currency or "USD"
+        self.fx_rate = float(fx_rate or 1.0)
+        # Estimated per-market round-trip cost for this position (TRUE USD / %).
+        self.est_round_trip_cost_usd = 0.0
+        self.est_round_trip_cost_pct = 0.0
 
     def effective_stop(self):
         """The stop that actually protects the position — the tighter of the
@@ -166,6 +189,9 @@ class Position:
             "atr": round(self.atr, 4),
             "trail_stop": (round(self.trail_stop, 2)
                            if self.trail_stop is not None else None),
+            "currency": self.currency, "fx_rate": round(self.fx_rate, 4),
+            "est_round_trip_cost_usd": round(self.est_round_trip_cost_usd, 4),
+            "est_round_trip_cost_pct": round(self.est_round_trip_cost_pct, 3),
         }
 
 
@@ -309,6 +335,9 @@ class AutonomousEngine:
                 float(p["stop_loss"]), float(p["take_profit"]),
                 float(p["size"]), p.get("module") or "unknown",
                 p.get("opened_at"), list(p.get("reasons") or []),
+                atr=float(p.get("atr") or 0.0),
+                currency=p.get("currency") or "USD",
+                fx_rate=float(p.get("fx_rate") or 1.0),
             )
 
         # Journal, curve, memory — the dashboard's history
@@ -445,6 +474,11 @@ class AutonomousEngine:
         if "/" in symbol:
             return "crypto"
         return self.symbol_markets.get(symbol, "us")
+
+    def currency_of(self, symbol: str) -> str:
+        """Native quote currency for a symbol. NSE quotes in INR; US equities
+        and crypto (USDT pairs) are priced in USD."""
+        return "INR" if self.market_of(symbol) == "india" else "USD"
 
     async def fetch_universe(self) -> dict[str, pd.DataFrame]:
         """Discover today's universe dynamically, then fetch OHLCV for it."""
@@ -655,6 +689,36 @@ class AutonomousEngine:
         rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
         module = "trend_follower" if abs(score) > 50 else "breakout" if vr > 1.3 else "mean_reverter"
 
+        # ── Cost-aware entry gate (applies ALONGSIDE the immutable R:R>=2:1) ──
+        # Uses the PER-MARKET round-trip cost at the SIZE this trade would take
+        # (planned notional = max_position_pct of equity). For NSE the flat Rs.20
+        # per-order floor dominates a tiny notional, so most $10 NSE setups are
+        # correctly rejected; US (~0.06%) and crypto (~0.30%) setups pass.
+        market = self.market_of(symbol)
+        fx_est = usd_rate(self.currency_of(symbol))
+        planned_notional_usd = self.equity * self.max_position_pct / 100
+        rt_cost_usd = round_trip_cost_usd(market, planned_notional_usd, fx_est)
+        rt_cost_pct = round_trip_cost_pct(market, planned_notional_usd, fx_est)
+        tp_move_pct = abs(tp - price) / price * 100 if price else 0.0
+        cost_floor = COST_EDGE_MULTIPLE * rt_cost_pct
+        if tp_move_pct < cost_floor:
+            flat_note = "flat-fee " if market == "india" else ""
+            log.info(f"SKIP {symbol}: {flat_note}cost {rt_cost_pct:.2f}% round-trip "
+                     f"at ${planned_notional_usd:.0f} notional exceeds edge — TP move "
+                     f"{tp_move_pct:.2f}% < floor {cost_floor:.2f}% "
+                     f"({COST_EDGE_MULTIPLE:g}x)")
+            self.audit.log_trade_decision(
+                action="SKIP", symbol=symbol,
+                setup={"symbol": symbol, "direction": direction,
+                       "current_price": round(price, 2),
+                       "take_profit": round(tp, 2), "risk_reward": round(rr, 2)},
+                portfolio_context={"equity": round(self.equity, 4)},
+                reasoning=(f"Cost-aware veto ({market}): target {tp_move_pct:.2f}% < "
+                           f"{cost_floor:.2f}% floor ({COST_EDGE_MULTIPLE:g}x "
+                           f"round-trip {rt_cost_pct:.2f}% at ${planned_notional_usd:.0f})."),
+            )
+            return None
+
         # Extra structure for the RuleBrain (Minervini trend template, 52-week rules)
         closes = enriched["close"]
         s150 = float(closes.rolling(150).mean().iloc[-1]) if len(closes) >= 150 else None
@@ -677,6 +741,10 @@ class AutonomousEngine:
             "sma_50": s50 or None, "sma_150": s150, "sma_200": s200 or None,
             "sma_200_1m_ago": s200_1m, "high_52w": high_52w, "low_52w": low_52w,
             "market_sentiment": news_dir,
+            "market": market,
+            "est_round_trip_cost_usd": round(rt_cost_usd, 4),
+            "est_round_trip_cost_pct": round(rt_cost_pct, 3),
+            "tp_move_pct": round(tp_move_pct, 3),
         }
 
         # ── Consult the RuleBrain: every decision carries rule citations ──
@@ -820,11 +888,12 @@ class AutonomousEngine:
             low = float(last["low"])
             close = float(last["close"])
 
-            # Update unrealized
+            # Update unrealized — native price move / fx = TRUE USD P&L
+            fx = pos.fx_rate or 1.0
             if pos.side == "BUY":
-                pos.unrealized = (close - pos.entry_price) * pos.size
+                pos.unrealized = (close - pos.entry_price) * pos.size / fx
             else:
-                pos.unrealized = (pos.entry_price - close) * pos.size
+                pos.unrealized = (pos.entry_price - close) * pos.size / fx
 
             # Ratchet trailing stop against the bar's favourable extreme.
             self._update_trailing_stop(pos, high if pos.side == "BUY" else low)
@@ -850,27 +919,38 @@ class AutonomousEngine:
         if not pos:
             return
 
-        # Slippage + commission
-        slip = exit_price * SLIPPAGE_PCT / 100
-        exit_price = exit_price - slip if pos.side == "BUY" else exit_price + slip
-        commission = pos.size * exit_price * COMMISSION_PCT / 100
+        # Per-market exit cost (brokerage + slippage + tax) in TRUE USD. Fill at
+        # the native mid — slippage is captured inside the cost model.
+        fx = pos.fx_rate or 1.0
+        market = self.market_of(symbol)
+        notional_usd = pos.size * exit_price / fx
+        exit_cost = order_cost_usd(market, notional_usd, fx)
 
+        # Gross P&L is a native price move x size; divide by fx for TRUE USD.
+        # pnl is booked NET of this exit cost (entry cost was taken on open).
         if pos.side == "BUY":
-            pnl = (exit_price - pos.entry_price) * pos.size - commission
+            pnl = (exit_price - pos.entry_price) * pos.size / fx - exit_cost
         else:
-            pnl = (pos.entry_price - exit_price) * pos.size - commission
+            pnl = (pos.entry_price - exit_price) * pos.size / fx - exit_cost
 
         self.equity += pnl
         self.peak_equity = max(self.peak_equity, self.equity)
         self.drawdown_pct = (self.peak_equity - self.equity) / self.peak_equity * 100
+        # Cost bookkeeping (TRUE USD). pnl above is already NET of exit_cost.
+        self.cost_drag_total += exit_cost
 
         trade = {
             "id": f"T{len(self.closed_trades)+1:04d}",
             "date": datetime.now(timezone.utc).isoformat(),
             "symbol": symbol, "side": pos.side,
+            # entry/exit shown in NATIVE currency; pnl is TRUE USD.
             "entry": pos.entry_price, "exit": round(exit_price, 2),
             "size": pos.size, "pnl": round(pnl, 4),
             "reason": reason, "module": pos.module,
+            "currency": pos.currency, "fx_rate": round(fx, 4),
+            "est_round_trip_cost_usd": round(pos.est_round_trip_cost_usd, 4),
+            "est_round_trip_cost_pct": round(pos.est_round_trip_cost_pct, 3),
+            "exit_cost_usd": round(exit_cost, 4),
         }
         self.closed_trades.append(trade)
         if self.store.enabled:
@@ -895,15 +975,17 @@ class AutonomousEngine:
             market_at_exit={"rsi": 0, "adx": 0},  # filled from latest data when available
         )
 
-        # Attribution — decompose P&L (§9.1) and update per-rule win/loss stats
+        # Attribution — decompose P&L (§9.1) and update per-rule win/loss stats.
+        # Feed USD-space entry/exit so the headline thesis/timing decomposition
+        # matches the TRUE-USD pnl (fx=1.0 for USD assets — unchanged there).
         attribution = self.attribution.on_trade_close(
-            trade_id=symbol, exit_price=round(exit_price, 2), exit_reason=reason,
-            pnl=round(pnl, 4), size=pos.size, entry_price=pos.entry_price,
+            trade_id=symbol, exit_price=round(exit_price / fx, 6), exit_reason=reason,
+            pnl=round(pnl, 4), size=pos.size, entry_price=pos.entry_price / fx,
         )
         if attribution:
             self._mem(
-                f"ATTRIBUTION {symbol}: thesis {attribution.thesis_pnl:+.4f}, "
-                f"execution {attribution.timing_pnl:+.4f}, regime={attribution.regime}",
+                f"ATTRIBUTION {symbol}: thesis ${attribution.thesis_pnl:+.4f}, "
+                f"execution ${attribution.timing_pnl:+.4f}, regime={attribution.regime}",
                 "info",
             )
 
@@ -925,10 +1007,20 @@ class AutonomousEngine:
             self.store.fire(self.store.save_trade(db_trade))
             self._persist_engine_state()
 
+        # For non-USD assets, spell out the currency fix: the same move is worth
+        # fx-times fewer real dollars than the raw native-point number.
+        fx_note = ""
+        if pos.currency != "USD" and fx != 1.0:
+            gross_native = ((exit_price - pos.entry_price) if pos.side == "BUY"
+                            else (pos.entry_price - exit_price)) * pos.size
+            fx_note = (f" [{pos.currency} {gross_native:+.2f} pts @ {fx:.2f} "
+                       f"{pos.currency}/USD = ${gross_native / fx:+.4f} USD]")
         if pnl > 0:
-            self._mem(f"WIN ${pnl:+.4f} on {symbol} ({reason}). {', '.join(pos.reasons[:2])}", "SUCCESS")
+            self._mem(f"WIN ${pnl:+.4f} on {symbol} ({reason}).{fx_note} "
+                      f"{', '.join(pos.reasons[:2])}", "SUCCESS")
         else:
-            self._mem(f"LOSS ${pnl:+.4f} on {symbol} ({reason}). Revisit: {', '.join(pos.reasons[:2])}", "FAIL")
+            self._mem(f"LOSS ${pnl:+.4f} on {symbol} ({reason}).{fx_note} "
+                      f"Revisit: {', '.join(pos.reasons[:2])}", "FAIL")
 
     def open_position(self, setup: dict):
         if setup["symbol"] in self.positions:
@@ -936,32 +1028,50 @@ class AutonomousEngine:
         if len(self.positions) >= self.max_concurrent:
             return
 
-        price = setup["current_price"]
-        sl = setup["stop_loss"]
+        price = setup["current_price"]          # native currency (INR for NSE)
+        sl = setup["stop_loss"]                  # native currency
         risk_per_unit = abs(price - sl)
         if risk_per_unit <= 0:
             return
 
-        # Size: risk max_position_pct of equity
+        # ── Currency: size and cap notional in TRUE USD ──────────────────
+        # equity is USD; NSE prices are INR. Convert price/stop to USD so
+        # "10% of equity notional" and per-unit risk are real dollars, not
+        # rupee-points. USD assets carry fx=1.0 -> identical to before.
+        currency = self.currency_of(setup["symbol"])
+        fx = usd_rate(currency)
+        price_u = price / fx
+        risk_per_unit_u = risk_per_unit / fx
+
+        # Size: risk max_position_pct of equity (all USD)
         risk_amount = self.equity * self.max_position_pct / 100
-        size = risk_amount / risk_per_unit
-        notional = size * price
+        size = risk_amount / risk_per_unit_u
+        notional = size * price_u
         max_notional = self.equity * self.max_position_pct / 100
         if notional > max_notional:
-            size = max_notional / price
+            size = max_notional / price_u
 
-        # Slippage + commission on entry
-        slip = price * SLIPPAGE_PCT / 100
-        entry = price + slip if setup["direction"] == "BUY" else price - slip
-        commission = size * entry * COMMISSION_PCT / 100
-        self.equity -= commission
+        # Per-market entry cost (brokerage + slippage + tax), booked in TRUE USD.
+        # Fill at the native mid; the cost model already accounts for slippage,
+        # so we don't also move the fill price (avoids double-counting).
+        market = self.market_of(setup["symbol"])
+        entry = price
+        notional_usd = size * entry / fx
+        entry_cost = order_cost_usd(market, notional_usd, fx)
+        self.equity -= entry_cost
+        self.cost_drag_total += entry_cost
+        rt_cost_usd = round_trip_cost_usd(market, notional_usd, fx)
+        rt_cost_pct = round_trip_cost_pct(market, notional_usd, fx)
 
         pos = Position(
             setup["symbol"], setup["direction"], round(entry, 2),
             sl, setup["take_profit"], round(size, 6),
             setup["module"], datetime.now(timezone.utc).isoformat(),
             setup["reasons"], atr=float(setup.get("atr") or 0.0),
+            currency=currency, fx_rate=fx,
         )
+        pos.est_round_trip_cost_usd = round(rt_cost_usd, 4)
+        pos.est_round_trip_cost_pct = round(rt_cost_pct, 3)
         self.positions[setup["symbol"]] = pos
 
         open_row = {
@@ -971,6 +1081,9 @@ class AutonomousEngine:
             "entry": round(entry, 2), "exit": None,
             "size": round(size, 6), "pnl": None,
             "reason": "OPEN", "module": setup["module"],
+            "currency": currency, "fx_rate": round(fx, 4),
+            "est_round_trip_cost_usd": round(rt_cost_usd, 4),
+            "est_round_trip_cost_pct": round(rt_cost_pct, 3),
         }
         self.closed_trades.append(open_row)
 
@@ -1003,13 +1116,14 @@ class AutonomousEngine:
                 "vetoed": cons.get("vetoed"),
             })
 
-        # Audit — full decision reasoning + investor-rule citations
-        risk_amount = size * abs(entry - sl)
+        # Audit — full decision reasoning + investor-rule citations.
+        # Notional and risk are booked in TRUE USD (native / fx).
+        risk_amount = size * abs(entry - sl) / fx
         portfolio_context = {
             "equity": round(self.equity, 4),
             "drawdown_pct": round(self.drawdown_pct, 4),
             "open_positions": len(self.positions),
-            "position_size": round(size * entry, 4),
+            "position_size": round(size * entry / fx, 4),
             "risk_amount": round(risk_amount, 4),
             "risk_pct": round(risk_amount / self.equity * 100, 2),
         }
@@ -1041,6 +1155,21 @@ class AutonomousEngine:
             f"SL=${sl} TP=${setup['take_profit']} ({setup['module']}, score={setup['score']})",
             "info"
         )
+
+    def _cost_by_market_snapshot(self) -> dict:
+        """Indicative per-market round-trip cost at the current planned notional
+        (max_position_pct of equity). Shows why a small account should favour
+        US/crypto over flat-fee-dominated NSE intraday."""
+        notional = self.equity * self.max_position_pct / 100
+        out = {}
+        for mkt, cur in (("us", "USD"), ("crypto", "USD"), ("india", "INR")):
+            fx = usd_rate(cur)
+            out[mkt] = {
+                "notional_usd": round(notional, 2),
+                "round_trip_cost_usd": round(round_trip_cost_usd(mkt, notional, fx), 4),
+                "round_trip_cost_pct": round(round_trip_cost_pct(mkt, notional, fx), 3),
+            }
+        return out
 
     async def push_state(self):
         """Push current state to dashboard."""
@@ -1082,6 +1211,8 @@ class AutonomousEngine:
             "peak_equity": round(self.peak_equity, 4),
             "drawdown_pct": round(self.drawdown_pct, 4),
             "total_pnl": round(self.equity - self.initial_capital, 4),
+            "cost_drag_total": round(self.cost_drag_total, 4),
+            "cost_by_market": self._cost_by_market_snapshot(),
             "total_return_pct": round((self.equity - self.initial_capital) / self.initial_capital * 100, 2),
             "target_achieved": self.equity >= self.target_equity,
             "open_positions": [p.to_dict() for p in self.positions.values()],
@@ -1274,10 +1405,11 @@ class AutonomousEngine:
     def _sentry_manage_position(self, sym: str, pos: "Position", px: float):
         """Mark one position to `px`, ratchet its trailing stop, and close it
         if the effective stop or take-profit is breached."""
+        fx = pos.fx_rate or 1.0
         if pos.side == "BUY":
-            pos.unrealized = (px - pos.entry_price) * pos.size
+            pos.unrealized = (px - pos.entry_price) * pos.size / fx
         else:
-            pos.unrealized = (pos.entry_price - px) * pos.size
+            pos.unrealized = (pos.entry_price - px) * pos.size / fx
 
         moved = self._update_trailing_stop(pos, px)
         stop = pos.effective_stop()
