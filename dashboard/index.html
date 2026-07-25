@@ -824,8 +824,11 @@ function render() {
     const mh = state.market_hours || {};
     if (mh.ist_time !== undefined) {
         const oc = (v) => v ? '<span class="up">OPEN</span>' : '<span class="down">CLOSED</span>';
+        const hol = (name) => `<span class="down">HOLIDAY${name ? ' — ' + esc(name) : ''}</span>`;
+        const nse = mh.india_holiday ? hol(mh.india_holiday_name) : oc(mh.india);
+        const nyse = mh.us_holiday ? hol(mh.us_holiday_name) : oc(mh.us);
         document.getElementById('marketHours').innerHTML =
-            `NSE: ${oc(mh.india)} &middot; NYSE: ${oc(mh.us)} &middot; CRYPTO: ${oc(mh.crypto !== false)}`;
+            `NSE: ${nse} &middot; NYSE: ${nyse} &middot; CRYPTO: ${oc(mh.crypto !== false)}`;
     }
 
     // Portfolio metrics

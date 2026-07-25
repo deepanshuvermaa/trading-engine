@@ -41,6 +41,9 @@ from data.ingestion.crypto import CryptoProvider
 from data.ingestion.us_equity import USEquityProvider
 from data.ingestion.indian_equity import IndianEquityProvider
 from data.fx import to_usd, usd_rate, rate_source
+from data.holidays import (
+    is_nse_holiday, is_nyse_holiday, holiday_name_nse, holiday_name_nyse,
+)
 from data.costs import (
     order_cost_usd, round_trip_cost_usd, round_trip_cost_pct, cost_breakdown,
 )
@@ -228,13 +231,23 @@ def market_hours_status(now: datetime | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     ist = now.astimezone(IST)
     ny = now.astimezone(US_EASTERN)
-    nse_open = ist.weekday() < 5 and (9, 15) <= (ist.hour, ist.minute) < (15, 30)
-    nyse_open = ny.weekday() < 5 and (9, 30) <= (ny.hour, ny.minute) < (16, 0)
+    india_holiday = is_nse_holiday(ist.date())
+    us_holiday = is_nyse_holiday(ny.date())
+    nse_open = (ist.weekday() < 5
+                and (9, 15) <= (ist.hour, ist.minute) < (15, 30)
+                and not india_holiday)
+    nyse_open = (ny.weekday() < 5
+                 and (9, 30) <= (ny.hour, ny.minute) < (16, 0)
+                 and not us_holiday)
     return {
         "india": nse_open,
         "us": nyse_open,
         "crypto": True,
         "ist_time": ist.strftime("%H:%M"),
+        "india_holiday": india_holiday,
+        "india_holiday_name": holiday_name_nse(ist.date()),
+        "us_holiday": us_holiday,
+        "us_holiday_name": holiday_name_nyse(ny.date()),
     }
 
 
@@ -774,10 +787,18 @@ class AutonomousEngine:
         fetch_markets = ["crypto"]
         if hours["india"]:
             fetch_markets.append("india")
+        elif hours.get("india_holiday"):
+            _nm = hours.get("india_holiday_name")
+            self._mem(f"NSE holiday{f' ({_nm})' if _nm else ''} — "
+                      "Indian equities closed today")
         else:
             self._mem("NSE closed — skipping Indian equities this scan")
         if hours["us"]:
             fetch_markets.append("us")
+        elif hours.get("us_holiday"):
+            _nm = hours.get("us_holiday_name")
+            self._mem(f"NYSE holiday{f' ({_nm})' if _nm else ''} — "
+                      "US equities closed today")
         else:
             self._mem("NYSE closed — skipping US equities this scan")
 
