@@ -262,6 +262,30 @@ async def post_refresh_news():
     return {"ok": True, "news": ENGINE_STATE.get("news")}
 
 
+@app.get("/api/report", response_class=HTMLResponse)
+async def get_report(days: int = 7, cohort: str = "all"):
+    """Equity-research-grade weekly audit note (print-ready HTML → PDF)."""
+    from reports.research_note import build_report
+    days = max(1, min(days, 90))
+    try:
+        return build_report(ENGINE_STATE, days=days, cohort=cohort)
+    except Exception as e:
+        return HTMLResponse(f"<h1>Report error</h1><pre>{e}</pre>", status_code=500)
+
+
+@app.get("/api/report.csv")
+async def get_report_csv(days: int = 7, cohort: str = "all"):
+    """Closed-trade blotter as CSV."""
+    from fastapi.responses import PlainTextResponse
+    from reports.research_note import build_csv
+    days = max(1, min(days, 90))
+    csv_text = build_csv(days=days, cohort=cohort)
+    return PlainTextResponse(csv_text, headers={
+        "Content-Disposition": f'attachment; filename="blotter_{days}d.csv"',
+        "Content-Type": "text/csv",
+    })
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     html_path = Path(__file__).parent / "index.html"
