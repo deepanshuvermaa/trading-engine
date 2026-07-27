@@ -97,7 +97,11 @@ COMMISSION_PCT = _env_float("COMMISSION_PCT", 0.1)   # per side, % of notional
 SLIPPAGE_PCT = _env_float("SLIPPAGE_PCT", 0.05)      # per fill, % of price
 # A setup's target must clear the (per-market) round-trip cost drag by this
 # multiple or the trade is skipped — no point entering when fees eat the edge.
-COST_EDGE_MULTIPLE = _env_float("COST_EDGE_MULTIPLE", 3.0)
+COST_EDGE_MULTIPLE = _env_float("COST_EDGE_MULTIPLE", 5.0)
+# Anti-churn: after closing a symbol, a cohort may not re-open it for this many
+# minutes. Stops the 15m loop from repeatedly round-tripping the same name and
+# bleeding fees. Env-overridable.
+REENTRY_COOLDOWN_MIN = _env_float("REENTRY_COOLDOWN_MIN", 120.0)
 
 # The self-improvement substrate (frozen anchors, experiments, state, lessons).
 LOOP_DIR = Path(__file__).parent / ".loop"
@@ -340,6 +344,8 @@ class Portfolio:
         self._verdicts: dict[str, object] = {}
         self._entry_votes: dict[str, list] = {}
         self._position_consensus: dict[str, dict] = {}
+        # Anti-churn: symbol -> UTC datetime it was last closed (re-entry cooldown).
+        self._last_closed: dict[str, datetime] = {}
 
     def allows(self, market: str) -> bool:
         """True if this cohort is permitted to trade the given internal market."""
@@ -984,6 +990,17 @@ class AutonomousEngine:
         # (planned notional = max_position_pct of equity). For NSE the flat Rs.20
         # per-order floor dominates a tiny notional, so most $10 NSE setups are
         # correctly rejected; US (~0.06%) and crypto (~0.30%) setups pass.
+        # ── Anti-churn re-entry cooldown ──────────────────────────────────
+        # After closing a name, don't immediately re-open it — the biggest
+        # source of fee bleed is the 15m loop round-tripping the same symbol.
+        last_close = portfolio._last_closed.get(symbol)
+        if last_close is not None and REENTRY_COOLDOWN_MIN > 0:
+            age_min = (datetime.now(timezone.utc) - last_close).total_seconds() / 60.0
+            if age_min < REENTRY_COOLDOWN_MIN:
+                log.info(f"SKIP {symbol} [{portfolio.id}]: re-entry cooldown "
+                         f"({age_min:.0f}m < {REENTRY_COOLDOWN_MIN:g}m since last close)")
+                return None
+
         market = self.market_of(symbol)
         fx_est = usd_rate(self.currency_of(symbol))
         planned_notional_usd = portfolio.equity * self.max_position_pct / 100
@@ -1213,6 +1230,9 @@ class AutonomousEngine:
         pos = portfolio.positions.pop(symbol, None)
         if not pos:
             return
+
+        # Stamp close time for the anti-churn re-entry cooldown.
+        portfolio._last_closed[symbol] = datetime.now(timezone.utc)
 
         # Per-market exit cost (brokerage + slippage + tax) in TRUE USD. Fill at
         # the native mid — slippage is captured inside the cost model.
