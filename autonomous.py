@@ -257,9 +257,15 @@ def market_hours_status(now: datetime | None = None) -> dict:
 
 class Position:
     def __init__(self, symbol, side, entry, sl, tp, size, module, opened_at,
-                 reasons, atr=0.0, trail_stop=None, currency="USD", fx_rate=1.0):
+                 reasons, atr=0.0, trail_stop=None, currency="USD", fx_rate=1.0,
+                 market="us"):
         self.symbol = symbol
         self.side = side
+        # Market ("crypto"/"us"/"india") is captured ONCE at open time and
+        # never re-derived later — see open_position()/_close_position() for
+        # why re-deriving from the shared, per-cycle-mutable symbol_markets
+        # dict is unsafe (a concurrent scan can rebuild it mid-trade).
+        self.market = market
         # Prices are stored in the asset's NATIVE currency (INR for NSE, USD
         # elsewhere) so all stop/target/trailing comparisons stay native-to-
         # native and unchanged. Money flows (unrealized/realized P&L, notional,
@@ -608,14 +614,26 @@ class AutonomousEngine:
             portfolio = self.portfolios.get(pid)
             if portfolio is None:
                 continue
+            # DB rows don't carry a `market` column (yet); derive it from the
+            # already-correctly-persisted currency + symbol shape rather than
+            # defaulting to "us" (which would reintroduce the mis-costing bug
+            # for a restored NSE position after a restart).
+            restored_currency = p.get("currency") or "USD"
+            if restored_currency == "INR":
+                restored_market = "india"
+            elif "/" in p["symbol"]:
+                restored_market = "crypto"
+            else:
+                restored_market = "us"
             portfolio.positions[p["symbol"]] = Position(
                 p["symbol"], p["side"], float(p["entry_price"]),
                 float(p["stop_loss"]), float(p["take_profit"]),
                 float(p["size"]), p.get("module") or "unknown",
                 p.get("opened_at"), list(p.get("reasons") or []),
                 atr=float(p.get("atr") or 0.0),
-                currency=p.get("currency") or "USD",
+                currency=restored_currency,
                 fx_rate=float(p.get("fx_rate") or 1.0),
+                market=restored_market,
             )
 
         # Journal + curve, per cohort; memory is shared
@@ -1001,8 +1019,14 @@ class AutonomousEngine:
                          f"({age_min:.0f}m < {REENTRY_COOLDOWN_MIN:g}m since last close)")
                 return None
 
+        # Resolve market/currency ONCE here and thread them through the rest of
+        # this scan + the setup dict — never re-derive via self.market_of() /
+        # self.currency_of() later (those read the shared self.symbol_markets
+        # dict, which a concurrent scan can rebuild between scoring and
+        # open_position(), silently flipping currency and mis-sizing ~83x).
         market = self.market_of(symbol)
-        fx_est = usd_rate(self.currency_of(symbol))
+        currency = "INR" if market == "india" else "USD"
+        fx_est = usd_rate(currency)
         planned_notional_usd = portfolio.equity * self.max_position_pct / 100
         rt_cost_usd = round_trip_cost_usd(market, planned_notional_usd, fx_est)
         rt_cost_pct = round_trip_cost_pct(market, planned_notional_usd, fx_est)
@@ -1050,6 +1074,14 @@ class AutonomousEngine:
             "sma_200_1m_ago": s200_1m, "high_52w": high_52w, "low_52w": low_52w,
             "market_sentiment": news_dir,
             "market": market,
+            # Stamp currency/fx HERE, from the market context this scan already
+            # resolved locally — never re-derive it later from the shared,
+            # per-cycle-mutable self.symbol_markets dict (that's a race: a
+            # concurrent scan-now / scheduled scan can rebuild that dict between
+            # scoring and open_position(), silently flipping an NSE symbol's
+            # currency to the "us" default and mis-sizing the position ~83x).
+            "currency": currency,
+            "fx_rate": fx_est,
             "est_round_trip_cost_usd": round(rt_cost_usd, 4),
             "est_round_trip_cost_pct": round(rt_cost_pct, 3),
             "tp_move_pct": round(tp_move_pct, 3),
@@ -1235,9 +1267,13 @@ class AutonomousEngine:
         portfolio._last_closed[symbol] = datetime.now(timezone.utc)
 
         # Per-market exit cost (brokerage + slippage + tax) in TRUE USD. Fill at
-        # the native mid — slippage is captured inside the cost model.
+        # the native mid — slippage is captured inside the cost model. Use the
+        # market/fx captured on THIS position at open time, not a fresh
+        # self.market_of() lookup — the shared symbol_markets dict can have
+        # been rebuilt (different universe) in the hours since this position
+        # was opened, which would otherwise apply the wrong market's fee model.
         fx = pos.fx_rate or 1.0
-        market = self.market_of(symbol)
+        market = getattr(pos, "market", None) or self.market_of(symbol)
         notional_usd = pos.size * exit_price / fx
         exit_cost = order_cost_usd(market, notional_usd, fx)
 
@@ -1358,8 +1394,17 @@ class AutonomousEngine:
         # equity is USD; NSE prices are INR. Convert price/stop to USD so
         # "10% of equity notional" and per-unit risk are real dollars, not
         # rupee-points. USD assets carry fx=1.0 -> identical to before.
-        currency = self.currency_of(setup["symbol"])
-        fx = usd_rate(currency)
+        #
+        # Trust the currency/fx the SCAN stamped into setup (resolved once,
+        # locally, at score time). Do NOT re-derive via self.currency_of()
+        # here — that reads the shared, per-cycle-mutable self.symbol_markets
+        # dict, which a concurrent scan can rebuild between scoring and this
+        # call, silently flipping an NSE symbol's currency to the "us"
+        # default and mis-sizing the position by ~83x (the fx rate). Fall
+        # back to the live lookup only for any legacy caller that doesn't
+        # pass a pre-stamped setup.
+        currency = setup.get("currency") or self.currency_of(setup["symbol"])
+        fx = float(setup.get("fx_rate") or usd_rate(currency))
         price_u = price / fx
         risk_per_unit_u = risk_per_unit / fx
 
@@ -1374,7 +1419,8 @@ class AutonomousEngine:
         # Per-market entry cost (brokerage + slippage + tax), booked in TRUE USD.
         # Fill at the native mid; the cost model already accounts for slippage,
         # so we don't also move the fill price (avoids double-counting).
-        market = self.market_of(setup["symbol"])
+        # Same rule as currency above: trust the scan-stamped market.
+        market = setup.get("market") or self.market_of(setup["symbol"])
         entry = price
         notional_usd = size * entry / fx
         entry_cost = order_cost_usd(market, notional_usd, fx)
@@ -1388,7 +1434,7 @@ class AutonomousEngine:
             sl, setup["take_profit"], round(size, 6),
             setup["module"], datetime.now(timezone.utc).isoformat(),
             setup["reasons"], atr=float(setup.get("atr") or 0.0),
-            currency=currency, fx_rate=fx,
+            currency=currency, fx_rate=fx, market=market,
         )
         pos.est_round_trip_cost_usd = round(rt_cost_usd, 4)
         pos.est_round_trip_cost_pct = round(rt_cost_pct, 3)
