@@ -990,18 +990,31 @@ class AutonomousEngine:
         if abs(score) < 25:
             return None
 
-        # SL 2x ATR, TP 4.2x ATR -> 2.1:1 reward:risk, clears the immutable
-        # Minervini V10 >=2:1 floor with a small margin so rounding never vetoes.
+        # Module decided FIRST, so the target can be sized to actually clear
+        # the immutable rule that gates THAT module.
+        #
+        # Bug this replaces: SL/TP used to be a single fixed 2x/4.2x ATR ratio
+        # (always exactly 2.1:1) computed before classification. D4
+        # (Druckenmiller, IMMUTABLE) requires >=3:1 on the trend_follower
+        # sleeve specifically -- so every trend_follower-classified setup
+        # (the highest-conviction |score|>50 signals) was being vetoed 100%
+        # of the time, everywhere, forever. That is a structural lockout, not
+        # the rule "correctly filtering low quality" -- 2.1 can never reach
+        # 3.0 no matter how good the setup is. Fix: widen ONLY the
+        # trend_follower target so it can clear D4 with margin; leave
+        # breakout/mean_reverter at the existing 2.1:1 (already clears the
+        # separate 2:1 floor those modules are actually gated on).
         direction = "BUY" if score > 0 else "SELL"
+        module = "trend_follower" if abs(score) > 50 else "breakout" if vr > 1.3 else "mean_reverter"
+        tp_mult = 6.4 if module == "trend_follower" else 4.2  # -> 3.2:1 vs 2.1:1
         if direction == "BUY":
             sl = price - 2 * at
-            tp = price + 4.2 * at
+            tp = price + tp_mult * at
         else:
             sl = price + 2 * at
-            tp = price - 4.2 * at
+            tp = price - tp_mult * at
 
         rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
-        module = "trend_follower" if abs(score) > 50 else "breakout" if vr > 1.3 else "mean_reverter"
 
         # ── Cost-aware entry gate (applies ALONGSIDE the immutable R:R>=2:1) ──
         # Uses the PER-MARKET round-trip cost at the SIZE this trade would take
