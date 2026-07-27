@@ -1175,9 +1175,18 @@ class AutonomousEngine:
         planned_notional_pct = self.max_position_pct
         planned_risk_pct = planned_notional_pct * stop_pct / 100.0
 
+        # Native notional (entry_price * size) must be converted to TRUE USD
+        # via each position's OWN fx_rate before comparing against equity
+        # (also USD) -- summing raw INR notional against USD equity inflates
+        # gross exposure by ~83x for any NSE position, which was silently
+        # triggering D9's gross-exposure-cap veto (and could over-trigger D8)
+        # far more often than actual exposure warranted.
         gross = 0.0
         if portfolio.equity > 0:
-            gross = sum(p.entry_price * p.size for p in portfolio.positions.values()) / portfolio.equity * 100
+            gross = sum(
+                p.entry_price * p.size / (p.fx_rate or 1.0)
+                for p in portfolio.positions.values()
+            ) / portfolio.equity * 100
         closed = [t for t in portfolio.closed_trades if t.get("pnl") is not None]
         last10 = closed[-10:]
         wins10 = sum(1 for t in last10 if (t.get("pnl") or 0) > 0)
