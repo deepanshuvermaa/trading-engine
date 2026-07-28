@@ -97,7 +97,7 @@ COMMISSION_PCT = _env_float("COMMISSION_PCT", 0.1)   # per side, % of notional
 SLIPPAGE_PCT = _env_float("SLIPPAGE_PCT", 0.05)      # per fill, % of price
 # A setup's target must clear the (per-market) round-trip cost drag by this
 # multiple or the trade is skipped — no point entering when fees eat the edge.
-COST_EDGE_MULTIPLE = _env_float("COST_EDGE_MULTIPLE", 5.0)
+COST_EDGE_MULTIPLE = _env_float("COST_EDGE_MULTIPLE", 3.75)
 # Anti-churn: after closing a symbol, a cohort may not re-open it for this many
 # minutes. Stops the 15m loop from repeatedly round-tripping the same name and
 # bleeding fees. Env-overridable.

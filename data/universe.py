@@ -26,7 +26,7 @@ from utils.logger import get_logger
 log = get_logger("data.universe")
 
 US_LIMIT = 50
-INDIA_LIMIT = 30
+INDIA_LIMIT = 75
 CRYPTO_LIMIT = 30
 
 COINGECKO_URL = (
