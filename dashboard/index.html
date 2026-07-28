@@ -511,6 +511,12 @@ table.scoreboard .mkt-chip {
 
     <!-- ═════ COLUMN 1 — LEAD STORY + CHART + LEDGER ═════ -->
     <div class="col">
+        <section id="morningBriefingSec" style="display:none">
+            <div class="sec-head">Morning Briefing</div>
+            <div class="sec-sub">Read the report, discuss, watch the open, decide. Before each market opens, the house reads yesterday's ledger, the partners vote on today's live movers, and a watchlist is set &mdash; but nobody buys until the opening candle confirms the room's read.</div>
+            <div id="morningBriefingBody"></div>
+        </section>
+
         <section id="leadStory">
             <div class="lead-hed">Presses Warm Up as Engine Awaits First Scan</div>
             <div class="lead-deck">Trading desk to survey markets shortly; capital sits safely in cash</div>
@@ -883,6 +889,7 @@ function render() {
     renderCohorts(state.cohorts || []);
     renderTicker();
     renderLoop();
+    renderMorningBriefing();
     renderLead();
     drawEquityChart(state.equity_curve || []);
     renderAgents(state.agent_kpis || []);
@@ -904,6 +911,52 @@ function render() {
         pauseBtn.textContent = state.paused ? 'Resume the Presses' : 'Pause the Presses';
     }
     tickCountdown();
+}
+
+/* ── MORNING BRIEFING (pre-market watchlist + open-candle gate) ────── */
+function renderMorningBriefing() {
+    const sec = document.getElementById('morningBriefingSec');
+    const briefing = state.premarket_briefing || {};
+    const markets = Object.keys(briefing).filter(m => briefing[m] && (briefing[m].watchlist || []).length);
+    if (!markets.length) { sec.style.display = 'none'; return; }
+    sec.style.display = '';
+
+    const statusOf = (mkt, sym, confirmed, rejected) => {
+        if (confirmed.includes(sym)) return { txt: 'CONFIRMED', cls: 'up' };
+        if (rejected.includes(sym)) return { txt: 'REJECTED', cls: 'down' };
+        return { txt: 'AWAITING OPEN CANDLE', cls: 'dim' };
+    };
+
+    let html = '';
+    markets.forEach(mkt => {
+        const b = briefing[mkt] || {};
+        const wl = b.watchlist || [];
+        const confirmed = b.confirmed || [];
+        const rejected = b.rejected || [];
+        const y = b.yesterday || {};
+        html += `<div style="margin-bottom:14px">
+            <div style="font-weight:bold;text-transform:uppercase;letter-spacing:1px;font-size:11px;margin-bottom:4px">
+                ${esc(mkt)} &middot; <span class="tag">generated ${b.generated_at ? istTime(b.generated_at) + ' IST' : '—'}</span>
+            </div>
+            <div style="font-size:11px;color:var(--ink-light);margin-bottom:6px">
+                Yesterday: ${y.trades_closed||0} trade(s), ${(y.win_rate||0).toFixed(0)}% win rate,
+                net <span class="${(y.net_pnl||0) >= 0 ? 'up' : 'down'}">$${(y.net_pnl||0).toFixed(2)}</span>
+                &middot; ${b.candidates_scanned||0} candidates discussed, ${wl.length} made today's watchlist
+            </div>
+            <table><thead><tr><th>Symbol</th><th>Verdict</th><th>Strength</th><th>Price</th><th>Gap</th><th>Open-Candle Gate</th></tr></thead><tbody>
+            ${wl.map(w => {
+                const st = statusOf(mkt, w.symbol, confirmed, rejected);
+                return `<tr><td><b>${esc(w.symbol)}</b></td>
+                    <td class="${w.direction === 'BUY' ? 'up' : 'down'}">${esc(w.direction)}</td>
+                    <td>${w.strength||0}%</td>
+                    <td>${w.current_price !== undefined && w.current_price !== null ? fmt$(w.current_price) : '—'}</td>
+                    <td>${w.gap_pct !== undefined && w.gap_pct !== null ? (w.gap_pct >= 0 ? '+' : '') + w.gap_pct.toFixed(2) + '%' : '—'}</td>
+                    <td class="${st.cls}">${st.txt}</td></tr>`;
+            }).join('')}
+            </tbody></table>
+        </div>`;
+    });
+    document.getElementById('morningBriefingBody').innerHTML = html;
 }
 
 /* ── THE IMPROVEMENT LOOP panel ───────────────────────────── */

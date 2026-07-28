@@ -26,6 +26,7 @@ import traceback
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -54,6 +55,7 @@ from indicators.structural import (
 )
 from data.models import Signal
 from control.decision_audit import DecisionAudit
+from control.premarket import PremarketBriefing
 from db.store import get_store
 from knowledge.brain import RuleBrain
 from knowledge.anchor_guard import assert_anchors_untouched, AnchorTamperError
@@ -62,6 +64,7 @@ from macro.intelligence import MacroIntelligence
 from personas.engine import PersonaEngine
 from personas.manager import PortfolioManagerAgent, RiskManagerAgent
 from data.universe import UniverseDiscovery
+from data.ingestion.finnhub_client import get_finnhub_client
 from utils.logger import get_logger, get_recent_logs
 
 log = get_logger("autonomous")
@@ -400,6 +403,7 @@ class AutonomousEngine:
         self.us_eq = USEquityProvider(self.settings.engine.data_dir)
         self.indian_eq = IndianEquityProvider(self.settings.engine.data_dir)
 
+        self.finnhub = get_finnhub_client()  # live US/crypto quotes for Sentry marks
         self.store = get_store()  # Postgres persistence (no-op w/o DATABASE_URL)
         self.audit = DecisionAudit()
         self.brain = RuleBrain()  # codified investor rules — every decision cites them
@@ -427,6 +431,14 @@ class AutonomousEngine:
         self.trail_activation_atr = TRAIL_ACTIVATION_ATR
         self.trail_distance_atr = TRAIL_DISTANCE_ATR
         self.last_sentry_run: str | None = None
+
+        # ── Pre-market briefing (Part 3): "read the report, discuss, watch
+        # the open, decide". premarket_gate drives the opening-candle entry
+        # confirmation in run_cycle(); premarket_state holds the last
+        # briefing per market (surfaced via ENGINE_STATE["premarket_briefing"]).
+        self.premarket = PremarketBriefing(self)
+        self.premarket_gate: dict[str, dict] = {}   # symbol -> gate state
+        self.premarket_state: dict[str, dict] = {}  # market -> last briefing
 
         # ── COHORTS: one or more isolated paper portfolios (see parse_cohorts).
         # A single DISTRIBUTED cohort (COHORTS unset) == the original behaviour.
@@ -1239,6 +1251,70 @@ class AutonomousEngine:
             return "TRAILING_STOP" if pos.trail_stop >= pos.stop_loss else "STOP_LOSS"
         return "TRAILING_STOP" if pos.trail_stop <= pos.stop_loss else "STOP_LOSS"
 
+    def _update_premarket_gates(self, datasets: dict[str, pd.DataFrame]):
+        """Opening-candle confirmation (Part 3, step 2): the first COMPLETED
+        candle after a watchlist symbol's market opens must confirm the
+        premarket persona consensus direction (close above open for a
+        BULLISH/BUY consensus, close below open for BEARISH/SELL) before
+        entry is allowed. Runs ONCE per cycle (before any cohort's setup
+        loop) so every cohort sees the same gate decision this cycle."""
+        today_ist = datetime.now(timezone.utc).astimezone(IST).strftime("%Y-%m-%d")
+        today_us = datetime.now(timezone.utc).astimezone(US_EASTERN).strftime("%Y-%m-%d")
+        for sym, gate in self.premarket_gate.items():
+            if gate.get("status") != "PENDING":
+                continue
+            today_local = today_ist if gate.get("market") == "india" else today_us
+            if gate.get("date") != today_local:
+                continue  # stale (yesterday's briefing) — leave as-is, not today's gate
+            df = datasets.get(sym)
+            if df is None or df.empty:
+                continue
+            last = df.iloc[-1]
+            try:
+                o, c = float(last["open"]), float(last["close"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            confirmed = (c > o) if gate["direction"] == "BUY" else (c < o)
+            gate["status"] = "CONFIRMED" if confirmed else "REJECTED"
+            gate["transition_cycle"] = self.cycle
+            gate["opening_candle"] = {"open": round(o, 4), "close": round(c, 4)}
+            self._mem(
+                f"PREMARKET GATE {sym}: opening candle "
+                f"{'CONFIRMS' if confirmed else 'CONTRADICTS'} the "
+                f"{gate['direction']} consensus (O={o:.4f} C={c:.4f}) — "
+                f"{'entry allowed from next cycle' if confirmed else 'dropped from today actionable set'}",
+                "SUCCESS" if confirmed else "info")
+
+    def _premarket_gated_out(self, symbol: str) -> bool:
+        """True if `symbol` is on today's premarket watchlist and hasn't yet
+        cleared the opening-candle confirmation gate (still pending, just
+        confirmed THIS cycle, or rejected). Non-watchlist symbols are
+        never gated — the watchlist only ever ADDS a hurdle, it never
+        blocks the full-universe scan for anything else."""
+        gate = self.premarket_gate.get(symbol)
+        if not gate:
+            return False
+        status = gate.get("status")
+        if status == "PENDING" or status == "REJECTED":
+            return True
+        if status == "CONFIRMED" and gate.get("transition_cycle") == self.cycle:
+            # Confirmed by the candle we just saw THIS cycle — entry opens
+            # on the FOLLOWING cycle, never the same one.
+            return True
+        return False
+
+    def _premarket_briefing_snapshot(self) -> dict:
+        """ENGINE_STATE["premarket_briefing"]: last briefing per market plus
+        the LIVE confirmed/rejected lists derived from premarket_gate."""
+        out: dict[str, Any] = {}
+        for market, record in self.premarket_state.items():
+            confirmed = [s for s, g in self.premarket_gate.items()
+                        if g.get("market") == market and g.get("status") == "CONFIRMED"]
+            rejected = [s for s, g in self.premarket_gate.items()
+                       if g.get("market") == market and g.get("status") == "REJECTED"]
+            out[market] = dict(record) | {"confirmed": confirmed, "rejected": rejected}
+        return out
+
     def check_positions(self, portfolio: "Portfolio", datasets: dict[str, pd.DataFrame]):
         """Scout-side SL/TP/trailing check on the freshest candle (wick-accurate
         via high/low). Sentry protects between scans; both pop from the same
@@ -1628,6 +1704,7 @@ class AutonomousEngine:
                 "personas", {"votes_by_symbol": {}, "position_consensus": {},
                              "persona_records": self.personas.stats.records(),
                              "last_updated": None}),
+            "premarket_briefing": self._premarket_briefing_snapshot(),
             "memory_log": self.memory[-100:],
             "logs": get_recent_logs(50),
             "last_heartbeat": ENGINE_STATE.get("last_heartbeat"),
@@ -1668,6 +1745,17 @@ class AutonomousEngine:
         self._last_datasets = datasets  # freshest OHLCV for the held-out metric
         self._mem(f"Loaded {len(datasets)} assets")
 
+        # Pre-market briefing (Part 3): fires once per market per trading
+        # day, at/after that market's open — non-blocking best-effort, never
+        # raises into the cycle. Then reconcile the opening-candle
+        # confirmation gate against THIS cycle's freshest candles, once, so
+        # every cohort below sees an identical gate decision.
+        try:
+            await self.premarket.maybe_run()
+        except Exception as e:
+            self._mem(f"Premarket briefing error: {e}", "FAIL")
+        self._update_premarket_gates(datasets)
+
         # 2-4. COHORTS: every portfolio sees the SAME shared datasets this
         # instant, but checks its own book, applies its own market_filter, and
         # runs its OWN ranking/sizing/cost-gate/risk independently. The primary
@@ -1685,7 +1773,8 @@ class AutonomousEngine:
                 result = self.score_asset(portfolio, sym, df, macro=self.macro_snapshot)
                 if result:
                     scan_results.append(result)
-                    if abs(result["score"]) >= 25 and sym not in portfolio.positions:
+                    if (abs(result["score"]) >= 25 and sym not in portfolio.positions
+                            and not self._premarket_gated_out(sym)):
                         setups.append(result)
 
             # Rank and execute for THIS cohort
@@ -1726,7 +1815,8 @@ class AutonomousEngine:
         scan_results = primary_scan_results
         setups = [r for r in scan_results
                   if abs(r.get("score", 0)) >= 25
-                  and r["symbol"] not in self.primary.positions]
+                  and r["symbol"] not in self.primary.positions
+                  and not self._premarket_gated_out(r["symbol"])]
 
         # 3b. Company-level headlines (yfinance, flaky — best effort, cached).
         # Cap at the 15 highest-|score| results to bound cycle time.
@@ -2118,6 +2208,44 @@ class AutonomousEngine:
                 continue
         return out
 
+    async def _fetch_mark_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Sentry mark-price fetch: Finnhub FIRST for US-equity/crypto (removes
+        the ~15min yfinance delay for stop/trail checks), yfinance fast_info
+        for everything else (NSE — no Finnhub free-tier access — and any
+        US/crypto symbol Finnhub couldn't serve this tick)."""
+        prices: dict[str, float] = {}
+        yf_needed: list[str] = []
+
+        if self.finnhub.available:
+            fh_candidates = [s for s in symbols if self.market_of(s) in ("us", "crypto")]
+            if fh_candidates:
+                results = await asyncio.gather(
+                    *(self.finnhub.get_price(s, self.market_of(s)) for s in fh_candidates),
+                    return_exceptions=True,
+                )
+                got = 0
+                for sym, res in zip(fh_candidates, results):
+                    if isinstance(res, Exception) or res is None:
+                        yf_needed.append(sym)
+                        continue
+                    prices[sym] = float(res)
+                    got += 1
+                if got:
+                    log.info(f"SENTRY: Finnhub live quotes for {got}/{len(fh_candidates)} "
+                             f"US/crypto position(s)")
+            yf_needed += [s for s in symbols if self.market_of(s) == "india"]
+        else:
+            yf_needed = list(symbols)
+
+        if yf_needed:
+            yf_prices = await asyncio.to_thread(
+                self._fetch_last_prices_sync, yf_needed)
+            for sym, px in yf_prices.items():
+                prices.setdefault(sym, px)
+            log.info(f"SENTRY: yfinance fast_info fallback for "
+                     f"{len(yf_prices)}/{len(yf_needed)} position(s)")
+        return prices
+
     def _seconds_to_next_candle(self) -> float:
         """Seconds until the next Scout run. Candle-aligned in intraday mode
         (:00/:15/:30/:45 for 15m, off the UTC epoch grid); the old fixed
@@ -2185,8 +2313,7 @@ class AutonomousEngine:
             if hours.get(self.market_of(s), True)
         })
         if symbols:
-            prices = await asyncio.to_thread(
-                self._fetch_last_prices_sync, symbols)
+            prices = await self._fetch_mark_prices(symbols)
             for portfolio in self.portfolios.values():
                 for sym in list(portfolio.positions.keys()):
                     if sym not in prices:
@@ -2316,6 +2443,7 @@ class AutonomousEngine:
                 await self.store.save_engine_state(self._engine_state_row(p))
             await self.store.close()
         await self.crypto.close()
+        await self.finnhub.close()
 
 
 async def start_engine():

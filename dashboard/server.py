@@ -57,6 +57,7 @@ ENGINE_STATE: dict[str, Any] = {
     "rule_stats": {},
     "personas": {"votes_by_symbol": {}, "position_consensus": {},
                  "persona_records": [], "last_updated": None},
+    "premarket_briefing": {},
     "memory_log": [],
     "logs": [],
     "last_heartbeat": None,
