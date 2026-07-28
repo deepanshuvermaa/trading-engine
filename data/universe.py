@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 
+from data.ingestion.nse_live import get_nse_live_session
 from utils.logger import get_logger
 
 log = get_logger("data.universe")
@@ -69,17 +70,16 @@ class UniverseDiscovery:
 
         loop = asyncio.get_event_loop()
         us_task = loop.run_in_executor(None, self._discover_us)
-        india_task = loop.run_in_executor(None, self._discover_india)
+        india_task = self._discover_india()
         crypto_task = self._discover_crypto()
 
-        us, india, crypto = await asyncio.gather(
+        us, india_res, crypto = await asyncio.gather(
             us_task, india_task, crypto_task, return_exceptions=True
         )
 
         result: dict[str, Any] = {"sources": {}}
         for market, symbols, limit in (
             ("us", us, US_LIMIT),
-            ("india", india, INDIA_LIMIT),
             ("crypto", crypto, CRYPTO_LIMIT),
         ):
             if isinstance(symbols, Exception) or not symbols:
@@ -94,6 +94,23 @@ class UniverseDiscovery:
             else:
                 result[market] = self._dedupe(symbols)[:limit]
                 result["sources"][market] = "live"
+
+        # India: (symbols, source_label) — live NSE session first, bhavcopy
+        # fallback carries the day when NSE blocks/rate-limits us (see
+        # _discover_india's own auditable logging of which path fired).
+        if isinstance(india_res, Exception) or not india_res or not india_res[0]:
+            err = india_res if isinstance(india_res, Exception) else "empty result"
+            log.error(
+                f"UNIVERSE FALLBACK [india]: live discovery failed "
+                f"({err}) — using minimal default list "
+                f"({len(FALLBACK['india'])} symbols)"
+            )
+            result["india"] = list(FALLBACK["india"])
+            result["sources"]["india"] = "FALLBACK_DEFAULT"
+        else:
+            india_symbols, india_source = india_res
+            result["india"] = self._dedupe(india_symbols)[:INDIA_LIMIT]
+            result["sources"]["india"] = india_source
 
         result["counts"] = {m: len(result[m]) for m in ("us", "india", "crypto")}
         result["total"] = sum(result["counts"].values())
@@ -139,10 +156,67 @@ class UniverseDiscovery:
                 log.warning(f"US screener '{screener}' failed: {e}")
         return symbols
 
-    # ── India: NSE bhavcopy top movers via jugaad_data ──────────
+    # ── India: live NSE session FIRST, bhavcopy fallback ─────────
+
+    async def _discover_india(self) -> tuple[list[str], str]:
+        """Today's live NSE movers via NSELiveSession; if that returns
+        nothing usable, fall back to the bhavcopy (yesterday's data) path,
+        which remains the safety net. Returns (symbols, source_label) so the
+        caller can log/audit which path actually fired this cycle."""
+        try:
+            live_symbols = await self._discover_india_live()
+        except Exception as e:
+            log.warning(f"India universe: live NSE session errored ({e})")
+            live_symbols = []
+
+        if live_symbols:
+            log.info(f"India universe: live NSE session — "
+                     f"{len(live_symbols)} symbols")
+            return live_symbols, "live_nse_session"
+
+        log.warning("India universe: live NSE session returned nothing "
+                    "usable — falling back to bhavcopy (yesterday's data)")
+        loop = asyncio.get_event_loop()
+        try:
+            bhav_symbols = await loop.run_in_executor(
+                None, self._discover_india_bhavcopy)
+        except Exception as e:
+            log.error(f"India universe: bhavcopy fallback also failed ({e})")
+            return [], "bhavcopy_fallback"
+        log.info(f"India universe: bhavcopy fallback (yesterday's data) — "
+                 f"{len(bhav_symbols)} symbols")
+        return bhav_symbols, "bhavcopy_fallback"
 
     @staticmethod
-    def _discover_india() -> list[str]:
+    async def _discover_india_live() -> list[str]:
+        """Today's live gainers/losers + most-active via NSELiveSession.
+        Returns [] (never raises) if NSE's live endpoints don't cooperate —
+        the caller falls back to bhavcopy."""
+        session = get_nse_live_session()
+        picks: list[str] = []
+        try:
+            gl = await session.get_live_gainers_losers()
+            for side in ("gainers", "losers"):
+                picks += [r["symbol"] for r in gl.get(side, [])]
+        except Exception as e:
+            log.debug(f"India live gainers/losers unavailable: {e}")
+        try:
+            active = await session.get_live_most_active()
+            picks += [r["symbol"] for r in active]
+        except Exception as e:
+            log.debug(f"India live most-active unavailable: {e}")
+        if not picks:
+            try:
+                variations = await session.get_index_variations("NIFTY 500")
+                # Rank by absolute live %-change — the day's real movers.
+                variations.sort(key=lambda r: abs(r.get("pct_change", 0)), reverse=True)
+                picks += [r["symbol"] for r in variations[:INDIA_LIMIT]]
+            except Exception as e:
+                log.debug(f"India live index variations unavailable: {e}")
+        return [p for p in picks if p]
+
+    @staticmethod
+    def _discover_india_bhavcopy() -> list[str]:
         import pandas as pd
         from jugaad_data.nse import full_bhavcopy_save
 
