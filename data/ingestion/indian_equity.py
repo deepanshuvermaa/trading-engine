@@ -63,10 +63,17 @@ class IndianEquityProvider(DataProvider):
         if df.empty:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
-        # Drop duplicate columns (jugaad-data sometimes returns 'close' twice)
+        # Drop columns that are ALREADY duplicated under their raw jugaad-data
+        # names (rare, but happens).
         df = df.loc[:, ~df.columns.duplicated()]
 
-        # jugaad-data column names vary — normalize
+        # jugaad-data column names vary — normalize. NOTE: multiple distinct
+        # raw columns can map to the SAME target (e.g. "CLOSE" and "LTP" both
+        # -> "close") -- that duplication doesn't exist until AFTER this
+        # rename, so the dedup above (which runs on the pre-rename names)
+        # cannot catch it. A second dedup below, post-rename, is required --
+        # its absence was crashing every NSE daily-bar fetch with "Duplicate
+        # column names found" the moment jugaad-data returned both columns.
         col_map = {}
         for col in df.columns:
             cl = col.lower().strip()
@@ -84,6 +91,10 @@ class IndianEquityProvider(DataProvider):
                 col_map[col] = "timestamp"
 
         df = df.rename(columns=col_map)
+        # Re-dedup AFTER rename, keeping the first occurrence (the more
+        # "canonical" raw name, e.g. CLOSE over LTP, comes first in NSE's
+        # column order).
+        df = df.loc[:, ~df.columns.duplicated()]
 
         required = ["open", "high", "low", "close", "volume", "timestamp"]
         missing = [c for c in required if c not in df.columns]
