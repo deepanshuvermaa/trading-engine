@@ -33,6 +33,9 @@ US_EASTERN = ZoneInfo("America/New_York")
 DEFAULT_TOP_N = 10
 CANDIDATE_CAP = 30          # bound premarket scoring runtime per market
 LOOKBACK_DAYS = 260         # enough for SMA200 + 52w hi/lo
+# Watchlist admission bar, deliberately looser than live entry's 25 -- this
+# only decides "worth the panel's attention today," never opens a position.
+WATCHLIST_MIN_SCORE = 15.0
 
 
 class PremarketBriefing:
@@ -126,9 +129,18 @@ class PremarketBriefing:
         # Reuse the EXISTING score_asset -> RuleBrain -> PersonaEngine path,
         # scored against the primary cohort's book (read-only: this never
         # opens a position, only produces the same setup dict real scans do).
+        # A looser bar than live entry (25): this only builds a WATCHLIST, it
+        # never opens a position. The opening-candle confirmation gate (see
+        # run_cycle) is the real check before any actual entry. Going lower
+        # than this would start admitting pure noise the persona panel can't
+        # meaningfully discuss; going all the way down to 0 would defeat the
+        # point of having a bar at all -- 15 is the inversion-tested middle:
+        # loose enough to surface real but developing setups, not so loose
+        # the "morning discussion" is just reading random tickers.
         try:
             result = engine.score_asset(
-                engine.primary, symbol, df, macro=engine.macro_snapshot)
+                engine.primary, symbol, df, macro=engine.macro_snapshot,
+                min_score=WATCHLIST_MIN_SCORE)
         except Exception as e:
             log.debug(f"Premarket: score_asset failed for {symbol}: {e}")
             return None

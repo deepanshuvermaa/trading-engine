@@ -910,7 +910,7 @@ class AutonomousEngine:
             self._mem(f"Macro intel unavailable this cycle: {e}", "FAIL")
 
     def score_asset(self, portfolio: "Portfolio", symbol: str, df: pd.DataFrame,
-                    macro: dict | None = None) -> dict | None:
+                    macro: dict | None = None, min_score: float = 25.0) -> dict | None:
         # Scoring runs PER cohort: the technical/indicator/persona maths is
         # deterministic on the shared candle data, but the cost-aware gate and
         # the RuleBrain context read THIS cohort's own equity/book, so a setup
@@ -999,7 +999,13 @@ class AutonomousEngine:
         pct5 = (price - float(enriched["close"].iloc[-6])) / float(enriched["close"].iloc[-6]) * 100
         pct20 = (price - float(enriched["close"].iloc[-21])) / float(enriched["close"].iloc[-21]) * 100 if len(enriched) > 21 else 0
 
-        if abs(score) < 25:
+        # min_score defaults to 25 for live trading (unchanged). The
+        # premarket briefing passes a looser value -- it only builds a
+        # watchlist, never opens a position; the opening-candle confirmation
+        # gate is the real safety check before any real (paper) entry, so a
+        # softer bar here is fine. Loosening this default globally instead
+        # would have quietly loosened LIVE entry criteria as a side effect.
+        if abs(score) < min_score:
             return None
 
         # Module decided FIRST, so the target can be sized to actually clear
