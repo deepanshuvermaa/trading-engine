@@ -910,7 +910,8 @@ class AutonomousEngine:
             self._mem(f"Macro intel unavailable this cycle: {e}", "FAIL")
 
     def score_asset(self, portfolio: "Portfolio", symbol: str, df: pd.DataFrame,
-                    macro: dict | None = None, min_score: float = 25.0) -> dict | None:
+                    macro: dict | None = None, min_score: float = 25.0,
+                    skip_cost_gate: bool = False) -> dict | None:
         # Scoring runs PER cohort: the technical/indicator/persona maths is
         # deterministic on the shared candle data, but the cost-aware gate and
         # the RuleBrain context read THIS cohort's own equity/book, so a setup
@@ -1063,7 +1064,17 @@ class AutonomousEngine:
         rt_cost_pct = round_trip_cost_pct(market, planned_notional_usd, fx_est)
         tp_move_pct = abs(tp - price) / price * 100 if price else 0.0
         cost_floor = COST_EDGE_MULTIPLE * rt_cost_pct
-        if tp_move_pct < cost_floor:
+        # This gate answers "is it worth PAYING to enter this, right now, at
+        # this size" -- a real-order-economics question. The premarket
+        # watchlist never places an order (skip_cost_gate=True): it only
+        # asks "is this worth the panel's attention today," which the
+        # opening-candle confirmation gate re-checks for real before any
+        # actual entry -- by which point the position may be sized
+        # differently and the SAME gate applies again through the normal
+        # live path. Applying it here too was silently zeroing out NSE's
+        # watchlist entirely (its flat brokerage floor easily exceeds any
+        # realistic ATR-based target move at small notional).
+        if not skip_cost_gate and tp_move_pct < cost_floor:
             flat_note = "flat-fee " if market == "india" else ""
             log.info(f"SKIP {symbol} [{portfolio.id}]: {flat_note}cost {rt_cost_pct:.2f}% "
                      f"round-trip at ${planned_notional_usd:.0f} notional exceeds edge — "

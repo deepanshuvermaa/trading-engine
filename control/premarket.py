@@ -140,7 +140,7 @@ class PremarketBriefing:
         try:
             result = engine.score_asset(
                 engine.primary, symbol, df, macro=engine.macro_snapshot,
-                min_score=WATCHLIST_MIN_SCORE)
+                min_score=WATCHLIST_MIN_SCORE, skip_cost_gate=True)
         except Exception as e:
             log.debug(f"Premarket: score_asset failed for {symbol}: {e}")
             return None
