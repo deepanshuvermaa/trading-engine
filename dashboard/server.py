@@ -287,6 +287,31 @@ async def post_fix_position_currency(body: dict[str, Any] = Body(...)):
     return result
 
 
+@app.post("/api/universe/push-nse")
+async def post_push_nse_universe(body: dict[str, Any] = Body(...)):
+    """Local-relay bridge: a machine NOT on NSE's cloud-IP blocklist (see
+    data/ingestion/nse_live.py) runs the live-session fetch and pushes
+    today's real NSE movers here, since Railway's IP gets 403'd. This is
+    TIER 1 of a graceful fallback chain (data/universe.py::_discover_india)
+    -- if this never gets called, or the operator's machine is off, the
+    engine falls straight back to Railway's own live attempt, then
+    bhavcopy, then the hardcoded safety net, exactly as before this existed.
+
+    Requires a shared secret (RELAY_SECRET env var) -- an unauthenticated
+    endpoint that injects symbols into a live trading engine's universe
+    would let anyone on the internet steer what it trades."""
+    import os
+    secret = os.environ.get("RELAY_SECRET", "")
+    if not secret or body.get("secret") != secret:
+        raise HTTPException(status_code=401, detail="invalid or missing secret")
+    symbols = body.get("symbols")
+    if not symbols or not isinstance(symbols, list):
+        raise HTTPException(status_code=400, detail="symbols: list[str] required")
+    engine = _require_engine()
+    engine.universe.set_india_override(symbols)
+    return {"ok": True, "accepted": len(symbols)}
+
+
 @app.post("/api/refresh-news")
 async def post_refresh_news():
     """Force a fresh news/macro sweep, bypassing the cache."""

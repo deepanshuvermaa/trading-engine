@@ -48,6 +48,114 @@ FALLBACK = {
 }
 
 
+def _normalize_bhavcopy_df(df: Any) -> Any:
+    """Column-name/value normalisation shared by every bhavcopy consumer —
+    NSE's raw CSV headers/format have changed over the years (spaced-padded
+    strings, comma-thousands numerics, CLOSE_PRICE vs CLOSE, etc). Any code
+    that reads a bhavcopy DataFrame MUST go through this first so today's
+    live discovery and the historical rolling-universe reconstruction
+    (backtest/rolling_universe.py) are provably parsing it identically."""
+    import pandas as pd
+
+    df = df.copy()
+    df.columns = [c.strip().upper() for c in df.columns]
+    for col in ("SYMBOL", "SERIES"):
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+    if "SERIES" in df.columns:
+        df = df[df["SERIES"] == "EQ"]
+
+    def col(*names):
+        for n in names:
+            if n in df.columns:
+                return n
+        return None
+
+    close_c = col("CLOSE_PRICE", "CLOSE")
+    prev_c = col("PREV_CLOSE", "PREVCLOSE")
+    turn_c = col("TURNOVER_LACS", "TOTTRDVAL", "TURNOVER")
+    qty_c = col("TTL_TRD_QNTY", "TOTTRDQTY")
+
+    for c in (close_c, prev_c, turn_c, qty_c):
+        if c:
+            df[c] = pd.to_numeric(
+                df[c].astype(str).str.replace(",", "").str.strip(),
+                errors="coerce",
+            )
+
+    df.attrs["_close_col"] = close_c
+    df.attrs["_prev_col"] = prev_c
+    df.attrs["_turnover_col"] = turn_c
+    df.attrs["_qty_col"] = qty_c
+    return df
+
+
+def _fetch_bhavcopy_df(
+    anchor_date: date, max_back_days: int = 7, include_anchor: bool = False
+) -> tuple[Any, date | None]:
+    """Fetch+normalise the nearest NSE bhavcopy on/before `anchor_date`.
+
+    `include_anchor=True` tries `anchor_date` itself first, then walks
+    backward through `max_back_days` prior calendar days (skipping
+    weekends) until a session is found; `include_anchor=False` starts the
+    walk at `anchor_date - 1 day` (used by the live/"today" path, since
+    today's own bhavcopy isn't published until after the session closes).
+
+    Never looks FORWARD of `anchor_date` — this is the load-bearing
+    no-lookahead guarantee for the historical rolling-universe
+    reconstruction. Returns (None, None) if nothing is found."""
+    import pandas as pd
+    from jugaad_data.nse import full_bhavcopy_save
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="nse_bhav_"))
+    start_offset = 0 if include_anchor else 1
+    for back in range(start_offset, max_back_days + start_offset):
+        d = anchor_date - timedelta(days=back)
+        if d.weekday() >= 5:  # skip weekends
+            continue
+        try:
+            path = full_bhavcopy_save(d, str(tmpdir))
+            if path is None:
+                candidates = list(tmpdir.glob("*.csv"))
+                path = str(candidates[0]) if candidates else None
+            if path:
+                raw = pd.read_csv(path)
+                return _normalize_bhavcopy_df(raw), d
+        except Exception as e:
+            log.debug(f"NSE bhavcopy unavailable for {d}: {e}")
+    return None, None
+
+
+def _bhavcopy_top_movers(df: Any, limit: int) -> list[str]:
+    """Given an already-normalised bhavcopy DataFrame (see
+    `_normalize_bhavcopy_df`), rank symbols the same way both the live
+    discovery path and the historical rolling-universe path do: half by
+    biggest absolute %-change among liquid names (turnover >= median),
+    half by raw turnover/quantity ("most active"). Parameterised by
+    `limit` so callers can ask for a small historical basket (backtest,
+    top_n=15) or the larger live scan basket (INDIA_LIMIT)."""
+    close_c = df.attrs.get("_close_col")
+    prev_c = df.attrs.get("_prev_col")
+    turn_c = df.attrs.get("_turnover_col")
+    qty_c = df.attrs.get("_qty_col")
+
+    picks: list[str] = []
+    if close_c and prev_c:
+        liquid = df
+        if turn_c:
+            liquid = df[df[turn_c] >= df[turn_c].quantile(0.5)]
+        movers = liquid.assign(
+            _chg=((liquid[close_c] - liquid[prev_c]) / liquid[prev_c]).abs()
+        ).nlargest(max(limit // 2, 1), "_chg")
+        picks += movers["SYMBOL"].tolist()
+    rank_c = turn_c or qty_c
+    if rank_c:
+        active = df.nlargest(limit, rank_c)
+        picks += active["SYMBOL"].tolist()
+
+    return [p for p in picks if p and p == p]
+
+
 class UniverseDiscovery:
     """Discover the day's most tradeable symbols across all three markets."""
 
@@ -55,6 +163,34 @@ class UniverseDiscovery:
         self.cache_minutes = cache_minutes
         self._cache: dict[str, Any] | None = None
         self._fetched_at: datetime | None = None
+        # External push override (the local relay bridge — see
+        # scripts/nse_local_relay.py). This is TIER 1 of a graceful fallback
+        # chain: push override (fresh) -> Railway's own live NSE session ->
+        # bhavcopy -> hardcoded 5-name safety net. The relay depends on the
+        # operator's machine being on and connected, so it can NEVER be the
+        # only path -- if it's stale/absent, every call below just proceeds
+        # exactly as it did before this existed.
+        self._india_override: list[str] | None = None
+        self._india_override_at: datetime | None = None
+        self._india_override_ttl_min = 30
+
+    def set_india_override(self, symbols: list[str]) -> None:
+        """Called by the /api/universe/push-nse endpoint. Expires on its own
+        after _india_override_ttl_min -- no separate cleanup needed, and a
+        relay that goes offline mid-session degrades silently to bhavcopy."""
+        self._india_override = [s.strip().upper() for s in symbols if s and s.strip()]
+        self._india_override_at = datetime.now(timezone.utc)
+        # Force the next discover() to re-check india (don't serve a stale
+        # cached bhavcopy result for up to cache_minutes after a fresh push).
+        self._fetched_at = None
+
+    def _india_override_fresh(self) -> list[str] | None:
+        if not self._india_override or not self._india_override_at:
+            return None
+        age_min = (datetime.now(timezone.utc) - self._india_override_at).total_seconds() / 60.0
+        if age_min > self._india_override_ttl_min:
+            return None
+        return self._india_override
 
     async def discover(self, force: bool = False) -> dict[str, Any]:
         """Return {"crypto": [...], "us": [...], "india": [...],
@@ -159,10 +295,28 @@ class UniverseDiscovery:
     # ── India: live NSE session FIRST, bhavcopy fallback ─────────
 
     async def _discover_india(self) -> tuple[list[str], str]:
-        """Today's live NSE movers via NSELiveSession; if that returns
-        nothing usable, fall back to the bhavcopy (yesterday's data) path,
-        which remains the safety net. Returns (symbols, source_label) so the
-        caller can log/audit which path actually fired this cycle."""
+        """Fallback chain, richest-to-safest:
+          1. Local relay push override (fresh, <=30min old) -- a machine off
+             NSE's cloud-IP blocklist did the live-session fetch and pushed
+             the result here. Only source that can see TODAY's real movers
+             from Railway.
+          2. Railway's own live NSE session attempt -- usually 403s (NSE
+             blocks known cloud-provider IP ranges) but costs nothing to try,
+             and may work if that changes.
+          3. Bhavcopy -- yesterday's official NSE settlement file. Always
+             available on trading days, the load-bearing safety net.
+          4. Hardcoded 5-name default (FALLBACK) -- only if bhavcopy itself
+             is unreachable.
+        Every tier is independent; if 1 is stale/absent, 2-4 behave EXACTLY
+        as they did before the relay existed. Returns (symbols, source_label)
+        so the caller can log/audit which tier actually fired this cycle."""
+        override = self._india_override_fresh()
+        if override:
+            age_min = (datetime.now(timezone.utc) - self._india_override_at).total_seconds() / 60.0
+            log.info(f"India universe: local relay push override — "
+                     f"{len(override)} symbols ({age_min:.0f}min old)")
+            return override, "local_relay_live"
+
         try:
             live_symbols = await self._discover_india_live()
         except Exception as e:
@@ -217,74 +371,14 @@ class UniverseDiscovery:
 
     @staticmethod
     def _discover_india_bhavcopy() -> list[str]:
-        import pandas as pd
-        from jugaad_data.nse import full_bhavcopy_save
-
-        tmpdir = Path(tempfile.mkdtemp(prefix="nse_bhav_"))
-        df = None
-        # Walk back up to 7 calendar days to find the latest trading session
-        for back in range(1, 8):
-            d = date.today() - timedelta(days=back)
-            if d.weekday() >= 5:  # skip weekends
-                continue
-            try:
-                path = full_bhavcopy_save(d, str(tmpdir))
-                if path is None:
-                    candidates = list(tmpdir.glob("*.csv"))
-                    path = str(candidates[0]) if candidates else None
-                if path:
-                    df = pd.read_csv(path)
-                    break
-            except Exception as e:
-                log.debug(f"NSE bhavcopy unavailable for {d}: {e}")
+        # Today's picks: walk BACKWARD from yesterday (today's own bhavcopy
+        # isn't published until after the session closes, so `include_anchor`
+        # is deliberately False here — see backtest.rolling_universe for the
+        # historical-reconstruction variant that DOES anchor on its own date).
+        df, _used_date = _fetch_bhavcopy_df(date.today(), max_back_days=7, include_anchor=False)
         if df is None or df.empty:
             raise RuntimeError("no NSE bhavcopy found in last 7 days")
-
-        # Normalise column names / string values (NSE pads with spaces)
-        df.columns = [c.strip().upper() for c in df.columns]
-        for col in ("SYMBOL", "SERIES"):
-            if col in df.columns:
-                df[col] = df[col].astype(str).str.strip()
-
-        if "SERIES" in df.columns:
-            df = df[df["SERIES"] == "EQ"]
-
-        def col(*names):
-            for n in names:
-                if n in df.columns:
-                    return n
-            return None
-
-        close_c = col("CLOSE_PRICE", "CLOSE")
-        prev_c = col("PREV_CLOSE", "PREVCLOSE")
-        turn_c = col("TURNOVER_LACS", "TOTTRDVAL", "TURNOVER")
-        qty_c = col("TTL_TRD_QNTY", "TOTTRDQTY")
-
-        df = df.copy()
-        for c in (close_c, prev_c, turn_c, qty_c):
-            if c:
-                df[c] = pd.to_numeric(
-                    df[c].astype(str).str.replace(",", "").str.strip(),
-                    errors="coerce",
-                )
-
-        picks: list[str] = []
-        # Half the list: biggest absolute % movers (with real liquidity)
-        if close_c and prev_c:
-            liquid = df
-            if turn_c:
-                liquid = df[df[turn_c] >= df[turn_c].quantile(0.5)]
-            movers = liquid.assign(
-                _chg=((liquid[close_c] - liquid[prev_c]) / liquid[prev_c]).abs()
-            ).nlargest(INDIA_LIMIT // 2, "_chg")
-            picks += movers["SYMBOL"].tolist()
-        # Other half: highest turnover (most active)
-        rank_c = turn_c or qty_c
-        if rank_c:
-            active = df.nlargest(INDIA_LIMIT, rank_c)
-            picks += active["SYMBOL"].tolist()
-
-        return [p for p in picks if p and p == p]
+        return _bhavcopy_top_movers(df, INDIA_LIMIT)
 
     # ── Crypto: CoinGecko by 24h volume ─────────────────────────
 
