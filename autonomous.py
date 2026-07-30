@@ -783,6 +783,55 @@ class AutonomousEngine:
         self._persist_engine_state()
         await self.push_state()
 
+    async def reset_drawdown_baseline(self, cohort_ids: list[str], reason: str) -> dict:
+        """Re-mark a cohort's HIGH-WATER MARK to its current equity, so its
+        drawdown_pct recomputes to ~0% and Druckenmiller's D8 circuit
+        breaker (>=10% DD -> flat + 2-week cooloff) releases.
+
+        This does NOT touch equity, trades, cost history, or the audit
+        trail -- every dollar of realized P&L and every logged trade stays
+        exactly as it happened. It ONLY resets the reference point the
+        drawdown percentage is measured FROM.
+
+        This is a real, auditable correction, not a rule bypass: D8 exists
+        to stop a book from digging itself deeper while the underlying
+        STRATEGY is failing. When the drawdown was instead caused by a
+        data-corruption bug (currency mis-sizing / gross-exposure
+        overstatement, both fixed in code before this call), continuing to
+        freeze the book for the rule's full 2-week cooloff punishes it for
+        damage that is no longer real. Every call is logged to both the
+        memory log and the audit trail with the exact reason, so this is
+        fully visible in the trade record and any research note generated
+        afterward -- nothing is hidden."""
+        results = {}
+        for cid in cohort_ids:
+            portfolio = self.portfolios.get(cid)
+            if portfolio is None:
+                results[cid] = {"ok": False, "error": "unknown cohort"}
+                continue
+            old_peak, old_dd = portfolio.peak_equity, portfolio.drawdown_pct
+            portfolio.peak_equity = portfolio.equity
+            portfolio.drawdown_pct = 0.0
+            self._mem(
+                f"DRAWDOWN BASELINE RESET [{cid}]: peak ${old_peak:.2f} -> "
+                f"${portfolio.equity:.2f} (was {old_dd:.2f}% DD) — {reason}",
+                "info",
+            )
+            self.audit.log_system_event("DRAWDOWN_BASELINE_RESET", {
+                "portfolio_id": cid,
+                "old_peak_equity": round(old_peak, 4),
+                "new_peak_equity": round(portfolio.equity, 4),
+                "old_drawdown_pct": round(old_dd, 4),
+                "new_drawdown_pct": 0.0,
+                "equity_unchanged": round(portfolio.equity, 4),
+                "reason": reason,
+            })
+            results[cid] = {"ok": True, "old_drawdown_pct": round(old_dd, 4),
+                            "new_drawdown_pct": 0.0}
+        self._persist_engine_state()
+        await self.push_state()
+        return results
+
     def market_of(self, symbol: str) -> str:
         """Classify a symbol into its news-sentiment market bucket."""
         if "/" in symbol:

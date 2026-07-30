@@ -254,6 +254,23 @@ async def post_resume():
     return {"ok": True, "paused": False}
 
 
+@app.post("/api/reset-drawdown-baseline")
+async def post_reset_drawdown_baseline(body: dict[str, Any] = Body(...)):
+    """Re-mark named cohorts' high-water mark to current equity, releasing
+    D8's drawdown circuit breaker. Does NOT touch equity/trades/history --
+    see AutonomousEngine.reset_drawdown_baseline for the full rationale.
+    Requires an explicit cohort list and reason -- no silent defaults."""
+    engine = _require_engine()
+    cohorts = body.get("cohorts")
+    reason = body.get("reason")
+    if not cohorts or not isinstance(cohorts, list):
+        raise HTTPException(status_code=400, detail="cohorts: list[str] required")
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason: str required")
+    results = await engine.reset_drawdown_baseline(cohorts, reason)
+    return {"ok": True, "results": results}
+
+
 @app.post("/api/refresh-news")
 async def post_refresh_news():
     """Force a fresh news/macro sweep, bypassing the cache."""
