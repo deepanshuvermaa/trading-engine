@@ -271,6 +271,22 @@ async def post_reset_drawdown_baseline(body: dict[str, Any] = Body(...)):
     return {"ok": True, "results": results}
 
 
+@app.post("/api/fix-position-currency")
+async def post_fix_position_currency(body: dict[str, Any] = Body(...)):
+    """Correct an open position's mis-tagged currency/fx_rate/market (does
+    NOT touch price/size/history). See AutonomousEngine.fix_position_currency."""
+    engine = _require_engine()
+    cohort = body.get("cohort")
+    symbol = body.get("symbol")
+    market = body.get("market")
+    reason = body.get("reason")
+    if not all([cohort, symbol, market, reason]):
+        raise HTTPException(status_code=400,
+                            detail="cohort, symbol, market, reason all required")
+    result = await engine.fix_position_currency(cohort, symbol, market, reason)
+    return result
+
+
 @app.post("/api/refresh-news")
 async def post_refresh_news():
     """Force a fresh news/macro sweep, bypassing the cache."""

@@ -832,6 +832,48 @@ class AutonomousEngine:
         await self.push_state()
         return results
 
+    async def fix_position_currency(self, cohort_id: str, symbol: str,
+                                     market: str, reason: str) -> dict:
+        """Correct an OPEN position's stored currency/fx_rate/market that was
+        mis-tagged at entry (e.g. an NSE symbol that resolved to "us"/USD
+        because engine.symbol_markets didn't have it yet when it was scored
+        -- see the premarket-briefing fix this accompanies). Does NOT touch
+        entry_price, size, stop_loss, take_profit, or any history -- those
+        are unaffected because they're stored in the asset's NATIVE currency
+        already. This ONLY corrects the currency/fx_rate/market fields used
+        to convert that native price into TRUE USD for P&L and risk math, so
+        the eventual close computes real, not 83x-inflated/deflated, P&L.
+
+        Every call is logged to the memory log and a POSITION_CURRENCY_FIX
+        audit event -- fully visible, nothing silent."""
+        portfolio = self.portfolios.get(cohort_id)
+        if portfolio is None:
+            return {"ok": False, "error": "unknown cohort"}
+        pos = portfolio.positions.get(symbol)
+        if pos is None:
+            return {"ok": False, "error": "no open position for that symbol"}
+
+        old_currency, old_fx, old_market = pos.currency, pos.fx_rate, pos.market
+        new_currency = "INR" if market == "india" else "USD"
+        new_fx = usd_rate(new_currency)
+        pos.currency, pos.fx_rate, pos.market = new_currency, new_fx, market
+        self.symbol_markets[symbol] = market  # stop it recurring on next scan
+
+        self._mem(
+            f"POSITION CURRENCY FIX [{cohort_id}] {symbol}: "
+            f"{old_currency}/fx={old_fx} -> {new_currency}/fx={new_fx:.2f} "
+            f"(market {old_market} -> {market}) — {reason}", "info")
+        self.audit.log_system_event("POSITION_CURRENCY_FIX", {
+            "portfolio_id": cohort_id, "symbol": symbol,
+            "old_currency": old_currency, "new_currency": new_currency,
+            "old_fx_rate": old_fx, "new_fx_rate": new_fx,
+            "old_market": old_market, "new_market": market,
+            "entry_price_unchanged": pos.entry_price, "reason": reason,
+        })
+        self._persist_engine_state()
+        await self.push_state()
+        return {"ok": True, "old_fx_rate": old_fx, "new_fx_rate": new_fx}
+
     def market_of(self, symbol: str) -> str:
         """Classify a symbol into its news-sentiment market bucket."""
         if "/" in symbol:

@@ -179,6 +179,21 @@ class PremarketBriefing:
         except Exception as e:
             log.warning(f"Premarket [{market}]: universe discovery failed: {e}")
             uni = {}
+        # CRITICAL: engine.market_of()/currency_of() resolve a symbol's market
+        # from engine.symbol_markets -- but that dict is normally only
+        # populated by autonomous.py's fetch_universe(), which this premarket
+        # path bypasses (it calls engine.universe.discover() directly). Any
+        # symbol not yet in symbol_markets silently defaults to "us" ->
+        # currency "USD" -> fx_rate 1.0, mis-sizing an NSE position ~83x --
+        # this reproduced the currency bug through a path the earlier fix
+        # didn't cover (live proof: SAIL/BLUESTONE/LASERPOWER opened with
+        # currency=USD, fx_rate=1.0 despite being rupee-priced NSE names).
+        # Merge every discovered symbol into symbol_markets here so ANY
+        # scoring path -- premarket or the regular Scout -- resolves currency
+        # correctly regardless of which one saw the symbol first.
+        for mkt in ("crypto", "us", "india"):
+            for s in uni.get(mkt, []):
+                engine.symbol_markets[s] = mkt
         candidates = list(uni.get(market, []))[:CANDIDATE_CAP]
 
         # 3. The agents discuss — full persona vote per candidate.
