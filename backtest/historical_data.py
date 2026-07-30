@@ -33,59 +33,41 @@ CACHE_DIR = str(Path(__file__).resolve().parent.parent / "data" / "storage" / "b
 
 LOOKBACK_DAYS = 730  # ~2 calendar years
 
-# symbol -> (display name, sector / category label). Representative, liquid
-# baskets per market — the SAME kind of names the live universe discovery
-# would surface, fixed here for reproducibility across runs.
-CRYPTO_BASKET: dict[str, tuple[str, str]] = {
-    "BTC/USDT": ("Bitcoin", "Store of Value / Layer 1"),
-    "ETH/USDT": ("Ethereum", "Smart Contract Platform"),
-    "SOL/USDT": ("Solana", "Smart Contract Platform"),
-    "BNB/USDT": ("BNB", "Exchange Token"),
-    "XRP/USDT": ("XRP", "Payments"),
-    "ADA/USDT": ("Cardano", "Smart Contract Platform"),
-    "DOGE/USDT": ("Dogecoin", "Meme / Payments"),
-    "AVAX/USDT": ("Avalanche", "Smart Contract Platform"),
-    "LINK/USDT": ("Chainlink", "Oracle / Infrastructure"),
-    "LTC/USDT": ("Litecoin", "Payments"),
-}
-US_BASKET: dict[str, tuple[str, str]] = {
-    "AAPL": ("Apple Inc.", "Technology"),
-    "MSFT": ("Microsoft Corp.", "Technology"),
-    "NVDA": ("NVIDIA Corp.", "Technology / Semiconductors"),
-    "AMZN": ("Amazon.com Inc.", "Consumer Discretionary"),
-    "GOOGL": ("Alphabet Inc.", "Communication Services"),
-    "META": ("Meta Platforms Inc.", "Communication Services"),
-    "TSLA": ("Tesla Inc.", "Consumer Discretionary"),
-    "JPM": ("JPMorgan Chase & Co.", "Financials"),
-    "V": ("Visa Inc.", "Financials"),
-    "UNH": ("UnitedHealth Group Inc.", "Healthcare"),
-    "XOM": ("Exxon Mobil Corp.", "Energy"),
-    "JNJ": ("Johnson & Johnson", "Healthcare"),
-    "PG": ("Procter & Gamble Co.", "Consumer Staples"),
-    "HD": ("Home Depot Inc.", "Consumer Discretionary"),
-    "MA": ("Mastercard Inc.", "Financials"),
-}
-NSE_BASKET: dict[str, tuple[str, str]] = {
-    "RELIANCE": ("Reliance Industries Ltd.", "Energy / Conglomerate"),
-    "TCS": ("Tata Consultancy Services Ltd.", "Technology"),
-    "HDFCBANK": ("HDFC Bank Ltd.", "Financials"),
-    "INFY": ("Infosys Ltd.", "Technology"),
-    "ICICIBANK": ("ICICI Bank Ltd.", "Financials"),
-    "HINDUNILVR": ("Hindustan Unilever Ltd.", "Consumer Staples"),
-    "SBIN": ("State Bank of India", "Financials"),
-    "BHARTIARTL": ("Bharti Airtel Ltd.", "Communication Services"),
-    "ITC": ("ITC Ltd.", "Consumer Staples"),
-    "KOTAKBANK": ("Kotak Mahindra Bank Ltd.", "Financials"),
-    "LT": ("Larsen & Toubro Ltd.", "Industrials"),
-    "AXISBANK": ("Axis Bank Ltd.", "Financials"),
-    "MARUTI": ("Maruti Suzuki India Ltd.", "Consumer Discretionary"),
-    "ASIANPAINT": ("Asian Paints Ltd.", "Materials"),
-    "BAJFINANCE": ("Bajaj Finance Ltd.", "Financials"),
-}
+# No hardcoded symbol lists. The basket for every market is discovered live
+# by data.universe.UniverseDiscovery -- the SAME dynamic top-movers/
+# most-active mechanism the production Scout loop uses to pick what to
+# trade. A backtest built on a hand-picked list (blue-chips, or someone's
+# guess at "volatile mid-caps") tests the strategy against a tape that
+# doesn't match what it actually trades live -- it proves nothing about
+# real performance. Sourcing the basket from live discovery means whatever
+# symbols get backtested are, by construction, the same kind of names the
+# system would genuinely be looking at today.
+#
+# This is still a single point-in-time snapshot (today's movers), not a
+# true rolling universe (a different basket reconstructed for every
+# historical day, matching what discovery would have surfaced ON that
+# date) -- that's the gold-standard version and a materially bigger build
+# (it needs day-by-day historical bhavcopy/screener reconstruction). Flagged
+# honestly as a known limitation, not silently glossed over.
+BASKET_SIZE_PER_MARKET = 15
 
-BASKETS: dict[str, dict[str, tuple[str, str]]] = {
-    "crypto": CRYPTO_BASKET, "us": US_BASKET, "india": NSE_BASKET,
-}
+
+async def _discover_baskets() -> dict[str, dict[str, tuple[str, str]]]:
+    """Pull TODAY's real top-movers/most-active per market via the live
+    UniverseDiscovery mechanism -- no fixed list. Sector/company-name labels
+    aren't available from discovery, so symbols are labeled honestly by
+    market rather than inventing a sector we didn't actually look up."""
+    from data.universe import UniverseDiscovery
+
+    uni = await UniverseDiscovery().discover(force=True)
+    labels = {"crypto": "Live Universe Discovery — Crypto (24h volume rank)",
+              "us": "Live Universe Discovery — US (gainers/losers/most-active)",
+              "india": "Live Universe Discovery — NSE (top movers/turnover)"}
+    baskets: dict[str, dict[str, tuple[str, str]]] = {}
+    for market in ("crypto", "us", "india"):
+        symbols = list(uni.get(market, []))[:BASKET_SIZE_PER_MARKET]
+        baskets[market] = {s: (s, labels[market]) for s in symbols}
+    return baskets
 
 PROVIDER_LABEL: dict[str, str] = {
     "crypto": "CryptoProvider (Binance via ccxt, yfinance daily fallback)",
@@ -130,6 +112,12 @@ async def fetch_all(
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=lookback_days)
 
+    baskets = await _discover_baskets()
+    total_discovered = sum(len(b) for b in baskets.values())
+    log.info(f"historical_data: basket discovered live — "
+             f"{ {m: len(b) for m, b in baskets.items()} } "
+             f"({total_discovered} symbols total, not hardcoded)")
+
     crypto = CryptoProvider("binance", CACHE_DIR)
     us_eq = USEquityProvider(CACHE_DIR)
     indian_eq = IndianEquityProvider(CACHE_DIR)
@@ -169,7 +157,7 @@ async def fetch_all(
 
     tasks = [
         fetch_one(market, symbol, name, sector)
-        for market, basket in BASKETS.items()
+        for market, basket in baskets.items()
         for symbol, (name, sector) in basket.items()
     ]
     await asyncio.gather(*tasks)
@@ -182,7 +170,7 @@ async def fetch_all(
 
     ok = sum(1 for r in reports if r.ok)
     log.info(f"historical_data: fetched {ok}/{len(reports)} symbols across "
-             f"{len(BASKETS)} markets, lookback {lookback_days}d "
+             f"{len(baskets)} markets, lookback {lookback_days}d "
              f"({start.date()} .. {end.date()})")
     for r in sorted(reports, key=lambda r: (r.market, r.symbol)):
         if r.ok:
