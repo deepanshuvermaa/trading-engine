@@ -875,15 +875,40 @@ class AutonomousEngine:
         return {"ok": True, "old_fx_rate": old_fx, "new_fx_rate": new_fx}
 
     def market_of(self, symbol: str) -> str:
-        """Classify a symbol into its news-sentiment market bucket."""
+        """Classify a symbol's market. FAILS LOUD, not silent-default: an
+        unregistered symbol used to quietly return "us" here, which meant
+        an NSE stock nobody had classified yet was priced/sized as if it
+        were a US dollar-quoted name -- the exact root cause of the
+        BAJFINANCE and SAIL/BLUESTONE/LASERPOWER currency bugs (both fixed
+        reactively, after real money-equivalent damage). Returns the
+        sentinel "unknown" instead, logged at ERROR every time so it's
+        impossible to miss, and money-affecting callers (score_asset,
+        open_position) MUST refuse to proceed on "unknown" rather than
+        guess. Non-critical callers (news bucketing, Finnhub batching,
+        market-hours filtering) degrade safely on "unknown" by design --
+        see their call sites, none of them move money."""
         if "/" in symbol:
             return "crypto"
-        return self.symbol_markets.get(symbol, "us")
+        market = self.symbol_markets.get(symbol)
+        if market is None:
+            log.error(f"UNKNOWN MARKET for symbol '{symbol}' -- not in "
+                      f"symbol_markets (no discovery cycle has classified "
+                      f"it yet). Returning 'unknown', NOT guessing 'us'. "
+                      f"Any money-affecting caller must reject this symbol.")
+            return "unknown"
+        return market
 
     def currency_of(self, symbol: str) -> str:
         """Native quote currency for a symbol. NSE quotes in INR; US equities
-        and crypto (USDT pairs) are priced in USD."""
-        return "INR" if self.market_of(symbol) == "india" else "USD"
+        and crypto (USDT pairs) are priced in USD. Returns "UNKNOWN" (not a
+        guess) when market_of() can't classify the symbol -- callers that
+        reach here for a money-affecting decision without having already
+        checked market_of()=="unknown" have a bug; this makes that bug loud
+        (an invalid ISO-4217-shaped string) instead of silently wrong."""
+        m = self.market_of(symbol)
+        if m == "unknown":
+            return "UNKNOWN"
+        return "INR" if m == "india" else "USD"
 
     async def fetch_universe(self) -> dict[str, pd.DataFrame]:
         """Discover today's universe dynamically, then fetch OHLCV for it."""
@@ -1148,6 +1173,16 @@ class AutonomousEngine:
         # dict, which a concurrent scan can rebuild between scoring and
         # open_position(), silently flipping currency and mis-sizing ~83x).
         market = self.market_of(symbol)
+        if market == "unknown":
+            # Hard block: NEVER guess a currency for a symbol nobody has
+            # classified. This is the fail-loud replacement for the silent
+            # "us" default that caused the BAJFINANCE and SAIL/BLUESTONE/
+            # LASERPOWER currency bugs -- market_of() already logged the
+            # ERROR; this refuses to let that unknown state reach any money
+            # math (sizing, cost gates, currency conversion).
+            log.error(f"REJECT {symbol}: unknown market, refusing to size/price "
+                      f"this setup rather than guess a currency.")
+            return None
         currency = "INR" if market == "india" else "USD"
         fx_est = usd_rate(currency)
         planned_notional_usd = portfolio.equity * self.max_position_pct / 100
@@ -1627,6 +1662,16 @@ class AutonomousEngine:
         # so we don't also move the fill price (avoids double-counting).
         # Same rule as currency above: trust the scan-stamped market.
         market = setup.get("market") or self.market_of(setup["symbol"])
+        if market == "unknown":
+            # Defensive hard block: score_asset already refuses to produce a
+            # setup with an unknown market, so this should be unreachable in
+            # normal operation. If it ever fires, that means some OTHER path
+            # constructed a setup dict without going through score_asset --
+            # refuse to open rather than silently guess a currency.
+            log.error(f"REFUSING to open {setup['symbol']} [{portfolio.id}]: "
+                      f"unknown market on a setup that bypassed score_asset's "
+                      f"guard. This should be unreachable -- investigate.")
+            return
         entry = price
         notional_usd = size * entry / fx
         entry_cost = order_cost_usd(market, notional_usd, fx)
