@@ -101,9 +101,18 @@ class CryptoProvider(DataProvider):
         df = df.set_index("timestamp").sort_index()
         df = df[~df.index.duplicated(keep="last")]
 
-        # Trim to requested range
+        # Trim to requested range. `end` may arrive tz-aware (e.g. callers
+        # passing datetime.now(timezone.utc), as backtest/historical_data.py
+        # does) or tz-naive -- pd.Timestamp(x, tz="UTC") raises
+        # "Cannot pass a datetime or Timestamp with tzinfo with the tz
+        # parameter" if x is ALREADY tz-aware, which was silently failing
+        # every single crypto historical fetch call from that path,
+        # including BTC/USDT -- not an IP-block/rate-limit issue at all,
+        # a real bug in this file.
         if end:
-            df = df[df.index <= pd.Timestamp(end, tz="UTC")]
+            end_ts = pd.Timestamp(end)
+            end_ts = end_ts.tz_localize("UTC") if end_ts.tzinfo is None else end_ts.tz_convert("UTC")
+            df = df[df.index <= end_ts]
 
         log.info(f"Fetched {len(df)} candles for {symbol} {timeframe}")
         return df
