@@ -308,3 +308,100 @@ async def get_report_csv(days: int = 7, cohort: str = "all"):
 async def dashboard():
     html_path = Path(__file__).parent / "index.html"
     return html_path.read_text(encoding="utf-8")
+
+
+# ── BACKTEST AUDIT: offline naive-vs-learned validation ──────────────────
+# Reuses the SAME production score_asset/RuleBrain/PersonaEngine/cost-gate
+# pipeline against real historical data (backtest/learning_validation.py).
+# Runs as a background task, offloaded to a thread for the CPU-bound
+# simulation, so it never blocks the live Scout/Sentry loops. Guarded by a
+# simple in-progress flag against concurrent runs.
+
+_BACKTEST_STATE: dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+    "last_report": None,       # full structured report dict (in-memory)
+    "last_json_path": None,
+    "last_md_path": None,
+}
+
+
+async def _run_backtest_background(lookback_days: int):
+    from backtest.learning_validation import run_learning_validation, write_report
+
+    _BACKTEST_STATE["running"] = True
+    _BACKTEST_STATE["error"] = None
+    _BACKTEST_STATE["started_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        report = await run_learning_validation(lookback_days)
+        json_path, md_path = write_report(report)
+        _BACKTEST_STATE["last_report"] = report
+        _BACKTEST_STATE["last_json_path"] = str(json_path)
+        _BACKTEST_STATE["last_md_path"] = str(md_path)
+    except Exception as e:
+        _BACKTEST_STATE["error"] = str(e)
+    finally:
+        _BACKTEST_STATE["running"] = False
+        _BACKTEST_STATE["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _backtest_summary() -> dict:
+    rep = _BACKTEST_STATE.get("last_report")
+    summary = None
+    if rep:
+        summary = {
+            "verdict": rep.get("verdict"),
+            "comparison": rep.get("comparison"),
+            "scope": {k: v for k, v in rep.get("scope", {}).items() if k != "fetch_reports"},
+            "live_rule_stats_untouched": rep.get("live_rule_stats_untouched"),
+        }
+    return {
+        "running": _BACKTEST_STATE["running"],
+        "started_at": _BACKTEST_STATE["started_at"],
+        "finished_at": _BACKTEST_STATE["finished_at"],
+        "error": _BACKTEST_STATE["error"],
+        "last_json_path": _BACKTEST_STATE["last_json_path"],
+        "last_md_path": _BACKTEST_STATE["last_md_path"],
+        "summary": summary,
+    }
+
+
+@app.get("/api/backtest/learning-validation")
+async def get_backtest_learning_validation(lookback_days: int = 730):
+    """Trigger the naive-vs-learned validation run in the background (takes
+    several minutes — data pull + two full walk-forward simulations) and
+    return the last COMPLETED report's summary + where to find the full
+    file. Poll this same endpoint (or /api/backtest/status) for progress."""
+    if _BACKTEST_STATE["running"]:
+        return {"ok": True, "triggered": False, "reason": "already running",
+                **_backtest_summary()}
+    lookback_days = max(60, min(lookback_days, 3650))
+    asyncio.create_task(_run_backtest_background(lookback_days))
+    return {"ok": True, "triggered": True, **_backtest_summary()}
+
+
+@app.get("/api/backtest/status")
+async def get_backtest_status():
+    """Lightweight polling endpoint for the dashboard's run/idle indicator."""
+    return _backtest_summary()
+
+
+@app.get("/api/backtest/report")
+async def get_backtest_report():
+    """Full structured trade-by-trade JSON (naive + learned) for the
+    BACKTEST AUDIT dashboard tab to render/filter client-side. Falls back to
+    the last report written to disk if the in-memory copy was lost (process
+    restart) but a completed run exists under reports/backtest/."""
+    rep = _BACKTEST_STATE.get("last_report")
+    if rep is None:
+        latest = Path("reports/backtest/latest.json")
+        if latest.exists():
+            try:
+                rep = json.loads(latest.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                rep = None
+    if rep is None:
+        return {"ok": False, "status": _backtest_summary(), "report": None}
+    return {"ok": True, "status": _backtest_summary(), "report": rep}

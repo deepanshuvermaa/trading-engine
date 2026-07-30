@@ -468,6 +468,7 @@ table.scoreboard .mkt-chip {
         <button class="tab-btn" id="tabNews">News Desk</button>
         <button class="tab-btn" id="tabRules">House Rules</button>
         <button class="tab-btn" id="tabPartners">The Partners' Room</button>
+        <button class="tab-btn" id="tabBacktest">Backtest Audit</button>
         <a class="tab-btn" id="tabReport" href="/api/report?days=7" target="_blank"
            style="text-decoration:none">Research Note &darr;</a>
         <a class="tab-btn" id="tabReportCsv" href="/api/report.csv?days=7" target="_blank"
@@ -765,6 +766,67 @@ table.scoreboard .mkt-chip {
         <div class="rules-banner" id="partnersBanner">The partners convene after the first scan.</div>
         <div id="partnersRecords"></div>
         <div id="partnersBody"></div>
+    </section>
+</div>
+
+<!-- ═════ BACKTEST AUDIT — full-page view ═════ -->
+<div id="backtestPage" style="display:none">
+    <section>
+        <div class="sec-head">Backtest Audit — Does The Learning Loop Help?</div>
+        <div class="sec-sub">An offline, institutional-grade audit of the production decision pipeline
+            (score_asset &rarr; RuleBrain &rarr; Partners' Room &rarr; cost gate) against real historical
+            data. Two full walk-forward simulations run on the SAME held-out window: one with every
+            learnable rule frozen at weight 1.0 ("naive"), one with the live, trade-shaped
+            knowledge/rule_stats.json weights ("learned"). Only the rule weights differ.</div>
+        <div class="rules-banner" id="btBanner">No backtest has been run yet this session.</div>
+        <div class="desk-box" style="margin-bottom:10px">
+            <div class="desk-actions">
+                <button class="desk-btn go" id="btnRunBacktest">Run New Backtest</button>
+                <span id="btStatusLine" class="dim" style="font-size:11px;margin-left:8px">idle</span>
+            </div>
+        </div>
+
+        <div id="btScopeBox"></div>
+        <div id="btComparisonBox"></div>
+
+        <div class="news-filters">
+            <input type="text" id="btSearch" placeholder="Search symbol / rule / persona&hellip;">
+            <select id="btRun">
+                <option value="">Both runs</option>
+                <option value="naive">Naive only</option>
+                <option value="learned">Learned only</option>
+            </select>
+            <select id="btMarket">
+                <option value="">All markets</option>
+                <option value="crypto">Crypto</option>
+                <option value="us">United States</option>
+                <option value="india">India</option>
+            </select>
+            <select id="btSide">
+                <option value="">Buy &amp; Sell</option>
+                <option value="BUY">Buy</option>
+                <option value="SELL">Sell</option>
+            </select>
+            <select id="btSort">
+                <option value="entry_date">Sort: entry date</option>
+                <option value="pnl">Sort: P&amp;L</option>
+                <option value="symbol">Sort: symbol</option>
+            </select>
+            <span class="dim" id="btCount" style="font-size:11px"></span>
+        </div>
+        <div class="scroll-x">
+        <table>
+            <thead><tr>
+                <th>Run</th><th>Symbol</th><th>Mkt</th><th>Side</th><th>Module</th>
+                <th>Entry</th><th>Exit</th><th>Reason</th><th>P&amp;L</th><th>P&amp;L %</th>
+                <th>Persona</th><th>Rule Citations</th>
+            </tr></thead>
+            <tbody id="btTradesBody"><tr><td colspan="12" class="dim">Run a backtest, or load the last completed one, to see trades here.</td></tr></tbody>
+        </table>
+        </div>
+
+        <div class="sec-head" style="margin-top:16px">Outcome Attribution &amp; Next-Trade Mechanism</div>
+        <div id="btAttributionBox"></div>
     </section>
 </div>
 
@@ -1787,6 +1849,7 @@ const TABS = {
     news:  ['tabNews', '#newsPage'],
     rules: ['tabRules', '#rulesPage'],
     partners: ['tabPartners', '#partnersPage'],
+    backtest: ['tabBacktest', '#backtestPage'],
 };
 function showTab(which) {
     Object.entries(TABS).forEach(([k, [btnId, sel]]) => {
@@ -1796,11 +1859,197 @@ function showTab(which) {
     if (which === 'news') renderNewsPage();
     if (which === 'rules') loadRules();
     if (which === 'partners') renderPartnersRoom();
+    if (which === 'backtest') loadBacktestReport();
 }
 document.getElementById('tabFront').addEventListener('click', () => showTab('front'));
 document.getElementById('tabNews').addEventListener('click', () => showTab('news'));
 document.getElementById('tabRules').addEventListener('click', () => showTab('rules'));
 document.getElementById('tabPartners').addEventListener('click', () => showTab('partners'));
+document.getElementById('tabBacktest').addEventListener('click', () => showTab('backtest'));
+
+/* ── BACKTEST AUDIT ────────────────────────────────────────── */
+let btReport = null;   // full report JSON from /api/backtest/report
+let btAllTrades = [];  // naive + learned trades, flattened
+let btPollTimer = null;
+
+async function fetchBacktestStatus() {
+    const r = await fetch('/api/backtest/status');
+    return r.json();
+}
+
+function renderBacktestStatus(status) {
+    const line = document.getElementById('btStatusLine');
+    const btn = document.getElementById('btnRunBacktest');
+    if (status.running) {
+        line.textContent = `running… started ${status.started_at || ''}`;
+        btn.disabled = true;
+    } else {
+        btn.disabled = false;
+        if (status.error) line.textContent = `last run FAILED: ${status.error}`;
+        else if (status.finished_at) line.textContent = `last completed: ${status.finished_at}`;
+        else line.textContent = 'idle — no completed run yet';
+    }
+}
+
+async function loadBacktestReport() {
+    const status = await fetchBacktestStatus();
+    renderBacktestStatus(status);
+    if (status.running && !btPollTimer) {
+        btPollTimer = setInterval(async () => {
+            const s = await fetchBacktestStatus();
+            renderBacktestStatus(s);
+            if (!s.running) {
+                clearInterval(btPollTimer); btPollTimer = null;
+                loadBacktestReport();
+            }
+        }, 5000);
+    }
+    const r = await fetch('/api/backtest/report');
+    const body = await r.json();
+    if (!body.ok || !body.report) {
+        document.getElementById('btBanner').textContent =
+            'No completed backtest report available yet. Click "Run New Backtest" — it takes a few minutes (real historical data pull + two full walk-forward simulations).';
+        return;
+    }
+    btReport = body.report;
+    document.getElementById('btBanner').textContent =
+        `Report generated ${btReport.scope.finished_at}. Live knowledge/rule_stats.json untouched: ${btReport.live_rule_stats_untouched}.`;
+    btAllTrades = (btReport.naive.trades || []).concat(btReport.learned.trades || []);
+    renderBacktestScope();
+    renderBacktestComparison();
+    renderBacktestAttribution();
+    renderBacktestTrades();
+}
+
+function renderBacktestScope() {
+    const scope = btReport.scope, meth = btReport.methodology;
+    const rows = (scope.fetch_reports || []).filter(r => r.ok);
+    const byMarket = {};
+    rows.forEach(r => { (byMarket[r.market] = byMarket[r.market] || []).push(r); });
+    let html = `<div class="sec-sub"><b>Lookback:</b> ${scope.lookback_days} days &middot; `
+        + `<b>Symbols:</b> ${scope.symbols_fetched_ok}/${scope.symbols_attempted} fetched &middot; `
+        + `<b>Split:</b> ${esc(meth.walk_forward_split)}</div>`;
+    Object.entries(byMarket).forEach(([mkt, syms]) => {
+        html += `<div style="margin:6px 0"><b>${esc(mkt.toUpperCase())}</b>: ` + syms.map(s =>
+            `${esc(s.symbol)} (${esc(s.name)}, ${esc(s.sector)}, ${s.bars}d bars ${esc(s.start)}&rarr;${esc(s.end)})`
+        ).join('; ') + `</div>`;
+    });
+    document.getElementById('btScopeBox').innerHTML = html;
+}
+
+function renderBacktestComparison() {
+    const cmp = btReport.comparison, v = btReport.verdict;
+    const rows = [
+        ['Sharpe ratio', 'sharpe_ratio'], ['Sortino ratio', 'sortino_ratio'],
+        ['Max drawdown %', 'max_drawdown_pct'], ['Win rate', 'win_rate'],
+        ['Profit factor', 'profit_factor'], ['Total trades', 'total_trades'],
+        ['Total return %', 'total_return_pct'], ['Calmar ratio', 'calmar_ratio'],
+    ];
+    let html = `<table><thead><tr><th>Metric</th><th>Naive</th><th>Learned</th><th>Delta</th></tr></thead><tbody>`;
+    rows.forEach(([label, key]) => {
+        const nv = cmp.naive[key], lv = cmp.learned[key];
+        html += `<tr><td>${label}</td><td class="num">${nv}</td><td class="num">${lv}</td>`
+            + `<td class="num ${lv-nv>=0?'up':'down'}">${(lv-nv>=0?'+':'')}${(lv-nv).toFixed(4)}</td></tr>`;
+    });
+    html += `</tbody></table><div class="sec-sub" style="margin-top:6px"><b>Verdict:</b> `
+        + `overall lean <b>${esc((v.overall_lean||'').toUpperCase())}</b> `
+        + `(confidence ${esc(v.confidence)}). ${v.lines.map(esc).join(' &middot; ')}<br>${esc(v.confidence_note)}</div>`;
+    document.getElementById('btComparisonBox').innerHTML = html;
+}
+
+function renderBacktestAttribution() {
+    const attrib = btReport.weight_attribution || [];
+    const examples = btReport.feeds_next_trade_examples || [];
+    let html = '';
+    if (attrib.length) {
+        html += `<div class="sec-sub">${attrib.length} learned-run trade(s) cited a rule carrying a non-1.0 weight:</div><ul>`;
+        attrib.slice(0, 20).forEach(a => {
+            html += `<li>${esc(a.trade_id)} (${esc(a.symbol)}, ${esc(a.entry_date)}): `
+                + `<b>${esc(a.rule_id)}</b> [${esc(a.investor)}] ${esc(a.effect)} to ${a.weight.toFixed(3)} `
+                + `(accuracy ${a.accuracy!=null?(a.accuracy*100).toFixed(0)+'%':'—'}, n=${a.samples}) — `
+                + `trade result <b>${esc(a.trade_outcome)}</b> ($${a.trade_pnl.toFixed(4)})</li>`;
+        });
+        html += `</ul>`;
+    } else {
+        html += `<div class="sec-sub">No learned-run trade in this sample cited a non-default-weight rule.</div>`;
+    }
+    if (examples.length) {
+        html += `<div class="sec-sub" style="margin-top:8px"><b>How this feeds the next trade</b> — RuleStats.record()/weight() applied to this run's own closed trades:</div>`;
+        examples.forEach(ex => {
+            html += `<div style="margin:6px 0"><b>${esc(ex.trade_id)} — ${esc(ex.symbol)}</b> `
+                + `(${esc(ex.entry_date)} &rarr; ${esc(ex.exit_date)}, ${esc(ex.outcome)} $${ex.pnl.toFixed(4)})<ul>`;
+            (ex.rule_updates || []).forEach(row => {
+                html += `<li>${esc(row.rule_id)} [${esc(row.investor)}]: `
+                    + `${row.rule_passed_at_entry ? 'PASSED' : 'FAILED'} at entry, trade ${row.trade_won ? 'WON' : 'LOST'} `
+                    + `&rarr; weight ${row.weight_before.toFixed(3)} &rarr; ${row.weight_after_this_trade.toFixed(3)}</li>`;
+            });
+            html += `</ul></div>`;
+        });
+    }
+    document.getElementById('btAttributionBox').innerHTML = html;
+}
+
+function renderBacktestTrades() {
+    const search = (document.getElementById('btSearch').value || '').toLowerCase();
+    const runF = document.getElementById('btRun').value;
+    const mktF = document.getElementById('btMarket').value;
+    const sideF = document.getElementById('btSide').value;
+    const sortKey = document.getElementById('btSort').value;
+
+    let rows = btAllTrades.filter(t => {
+        if (runF && t.run !== runF) return false;
+        if (mktF && t.market !== mktF) return false;
+        if (sideF && t.side !== sideF) return false;
+        if (search) {
+            const hay = [t.symbol, t.module, (t.rule_citations||[]).join(' '),
+                (t.persona_bulls||[]).join(' '), (t.persona_bears||[]).join(' ')].join(' ').toLowerCase();
+            if (!hay.includes(search)) return false;
+        }
+        return true;
+    });
+    rows.sort((a, b) => {
+        if (sortKey === 'pnl') return (b.pnl||0) - (a.pnl||0);
+        if (sortKey === 'symbol') return (a.symbol||'').localeCompare(b.symbol||'');
+        return (a.entry_date||'').localeCompare(b.entry_date||'');
+    });
+
+    document.getElementById('btCount').textContent = `${rows.length} of ${btAllTrades.length} trades`;
+    if (!rows.length) {
+        document.getElementById('btTradesBody').innerHTML =
+            '<tr><td colspan="12" class="dim">No trades match this filter.</td></tr>';
+        return;
+    }
+    document.getElementById('btTradesBody').innerHTML = rows.map(t => {
+        const citations = (t.rule_citations || []).slice(0, 3).map(esc).join('<br>');
+        const persona = t.persona_action
+            ? `${esc(t.persona_action)} (${t.persona_strength}%, ${esc(t.persona_dissent||'')})` : '—';
+        return `<tr>
+            <td>${esc(t.run)}</td><td>${esc(t.symbol)}</td><td>${esc(t.market)}</td>
+            <td>${esc(t.side)}</td><td>${esc(t.module)}</td>
+            <td>${esc(t.entry_date)} @ ${t.entry_price}</td>
+            <td>${esc(t.exit_date)} @ ${t.exit_price}</td>
+            <td>${esc(t.exit_reason)}</td>
+            <td class="num ${t.pnl>=0?'up':'down'}">${t.pnl>=0?'+':''}${(t.pnl||0).toFixed(4)}</td>
+            <td class="num ${t.pnl_pct>=0?'up':'down'}">${t.pnl_pct>=0?'+':''}${(t.pnl_pct||0).toFixed(2)}%</td>
+            <td style="font-size:10px">${persona}</td>
+            <td style="font-size:10px;max-width:280px">${citations}</td>
+        </tr>`;
+    }).join('');
+}
+
+['btSearch', 'btRun', 'btMarket', 'btSide', 'btSort'].forEach(id => {
+    const el = document.getElementById(id);
+    el.addEventListener(id === 'btSearch' ? 'input' : 'change', () => { if (btReport) renderBacktestTrades(); });
+});
+
+document.getElementById('btnRunBacktest').addEventListener('click', () => pressButton(
+    document.getElementById('btnRunBacktest'), 'Triggering…', async () => {
+        const r = await fetch('/api/backtest/learning-validation');
+        const body = await r.json();
+        wireToast(body.triggered ? 'Backtest triggered — this runs in the background, poll for completion'
+                                  : `Backtest already running (started ${body.started_at || ''})`);
+        loadBacktestReport();
+    }));
 
 /* ── THE EDITOR'S DESK (controls) ─────────────────────────── */
 async function post(url, body) {
