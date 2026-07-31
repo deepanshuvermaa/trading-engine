@@ -885,6 +885,62 @@ class AutonomousEngine:
         await self.push_state()
         return {"ok": True, "old_fx_rate": old_fx, "new_fx_rate": new_fx}
 
+    async def restate_trade(self, cohort_id: str, trade_id: str,
+                            fx_rate: float, reason: str) -> dict:
+        """Restate a CLOSED trade whose P&L was booked in the wrong currency
+        (native price treated as USD -> ~fx-times too large). This is an
+        accounting RESTATEMENT, not a deletion: the trade stays in the
+        record with its full history; only its P&L magnitude is corrected to
+        the true value (old_pnl / fx_rate), and the phantom difference is
+        credited back to the cohort's equity so the equity curve reflects
+        reality. A TRADE_RESTATEMENT audit event records old vs new so the
+        correction is fully transparent to any later review -- the honest
+        alternative to erasing an ugly-but-bug-caused number."""
+        portfolio = self.portfolios.get(cohort_id)
+        if portfolio is None:
+            return {"ok": False, "error": "unknown cohort"}
+        trade = next((t for t in portfolio.closed_trades
+                      if t.get("id") == trade_id and t.get("pnl") is not None), None)
+        if trade is None:
+            return {"ok": False, "error": "no closed trade with that id"}
+        if trade.get("restated"):
+            return {"ok": False, "error": "already restated"}
+        if not fx_rate or fx_rate <= 0:
+            return {"ok": False, "error": "fx_rate must be > 0"}
+
+        old_pnl = float(trade["pnl"])
+        new_pnl = round(old_pnl / fx_rate, 4)
+        delta = new_pnl - old_pnl  # phantom loss to credit back
+
+        trade["pnl"] = new_pnl
+        trade["restated"] = True
+        trade["original_pnl"] = old_pnl
+        trade["restatement_reason"] = reason
+
+        portfolio.equity += delta
+        portfolio.peak_equity = max(portfolio.peak_equity, portfolio.equity)
+        portfolio.drawdown_pct = (
+            (portfolio.peak_equity - portfolio.equity) / portfolio.peak_equity * 100
+            if portfolio.peak_equity > 0 else 0.0)
+
+        self._mem(
+            f"TRADE RESTATEMENT [{cohort_id}] {trade_id} {trade.get('symbol')}: "
+            f"P&L ${old_pnl:.2f} -> ${new_pnl:.2f} (currency bug, /{fx_rate:.1f}); "
+            f"${delta:+.2f} credited to equity — {reason}", "info")
+        self.audit.log_system_event("TRADE_RESTATEMENT", {
+            "portfolio_id": cohort_id, "trade_id": trade_id,
+            "symbol": trade.get("symbol"), "old_pnl": old_pnl,
+            "new_pnl": new_pnl, "equity_credit": round(delta, 4),
+            "fx_rate": fx_rate, "reason": reason,
+        })
+        if self.store.enabled:
+            self.store.fire(self.store.save_trade(dict(trade) | {"portfolio_id": cohort_id}))
+        self._persist_engine_state()
+        await self.push_state()
+        return {"ok": True, "old_pnl": old_pnl, "new_pnl": new_pnl,
+                "equity_credit": round(delta, 4),
+                "new_equity": round(portfolio.equity, 2)}
+
     def market_of(self, symbol: str) -> str:
         """Classify a symbol's market. FAILS LOUD, not silent-default: an
         unregistered symbol used to quietly return "us" here, which meant

@@ -312,6 +312,22 @@ async def post_push_nse_universe(body: dict[str, Any] = Body(...)):
     return {"ok": True, "accepted": len(symbols)}
 
 
+@app.post("/api/restate-trade")
+async def post_restate_trade(body: dict[str, Any] = Body(...)):
+    """Restate a closed trade's currency-bug-inflated P&L to its true value
+    and credit the phantom difference back to equity. Accounting correction,
+    not deletion -- see AutonomousEngine.restate_trade."""
+    engine = _require_engine()
+    cohort = body.get("cohort")
+    trade_id = body.get("trade_id")
+    fx_rate = body.get("fx_rate")
+    reason = body.get("reason")
+    if not all([cohort, trade_id, fx_rate, reason]):
+        raise HTTPException(status_code=400,
+                            detail="cohort, trade_id, fx_rate, reason all required")
+    return await engine.restate_trade(cohort, trade_id, float(fx_rate), reason)
+
+
 @app.post("/api/refresh-news")
 async def post_refresh_news():
     """Force a fresh news/macro sweep, bypassing the cache."""
