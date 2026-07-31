@@ -870,6 +870,17 @@ class AutonomousEngine:
             "old_market": old_market, "new_market": market,
             "entry_price_unchanged": pos.entry_price, "reason": reason,
         })
+        # CRITICAL: persist the corrected position to the POSITIONS table, not
+        # just engine_state. The first version of this method only called
+        # _persist_engine_state() (which snapshots cohort equity rows, NOT
+        # positions), so a corrected position lived only in memory -- a
+        # Railway redeploy/restart restored it from the untouched positions
+        # table with the OLD wrong currency, silently reverting the fix. This
+        # upsert is what makes the correction actually survive a restart.
+        if self.store.enabled:
+            self.store.fire(self.store.upsert_position(
+                pos.to_dict() | {"reasons": pos.reasons,
+                                 "portfolio_id": cohort_id}))
         self._persist_engine_state()
         await self.push_state()
         return {"ok": True, "old_fx_rate": old_fx, "new_fx_rate": new_fx}
