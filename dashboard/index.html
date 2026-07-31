@@ -559,7 +559,7 @@ table.scoreboard .mkt-chip {
             <table>
                 <thead><tr>
                     <th>No.</th><th>Date</th><th>Security</th><th>Side</th>
-                    <th>Bought At</th><th>Sold At</th><th>P&amp;L</th><th>Why Closed</th><th>Desk</th>
+                    <th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Why Closed</th><th>Desk</th>
                 </tr></thead>
                 <tbody id="journalBody"><tr><td colspan="9" class="dim">No trades on the books yet.</td></tr></tbody>
             </table>
@@ -1516,8 +1516,8 @@ function renderJournal(trades) {
             <td class="num">${esc(istDate(t.date))}</td>
             <td><b>${esc(t.symbol)}</b></td>
             <td class="${t.side==='BUY'?'up':'down'}">${t.side === 'BUY' ? 'LONG' : 'SHORT'}</td>
-            <td class="num">$${(t.entry||0).toFixed(2)}</td>
-            <td class="num">${t.exit ? '$'+t.exit.toFixed(2) : '<span class="dim">open</span>'}</td>
+            <td class="num">$${(t.entry||0).toFixed(2)}<br><span class="dim" style="font-size:9px">${t.side==='BUY'?'bought':'shorted'}</span></td>
+            <td class="num">${t.exit ? '$'+t.exit.toFixed(2)+'<br><span class="dim" style="font-size:9px">'+(t.side==='BUY'?'sold':'covered')+'</span>' : '<span class="dim">open</span>'}</td>
             <td class="num ${(t.pnl||0)>=0?'up':'down'}">${(t.pnl !== undefined && t.pnl !== null) ? '$'+(t.pnl>=0?'+':'')+t.pnl.toFixed(4) : '—'}</td>
             <td class="dim">${esc(t.reason||'OPEN')}</td>
             <td class="dim">${esc((t.module||'').replace(/_/g,' '))}</td>
