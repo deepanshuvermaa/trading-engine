@@ -36,6 +36,15 @@ CREATE TABLE IF NOT EXISTS positions (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS portfolio_id TEXT NOT NULL DEFAULT 'DISTRIBUTED';
+-- Currency/fx/market MUST persist: an NSE position is priced in INR but the
+-- book is USD. Without these columns, every restart restored a position with
+-- no currency, the code defaulted it to USD/fx=1.0, and an NSE position got
+-- mis-sized/mis-booked by the fx rate (~83-95x). This was the root cause of
+-- the recurring "currency bug" -- corrections were made in memory but had
+-- nowhere to persist, so every redeploy silently reverted them.
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'USD';
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS fx_rate DOUBLE PRECISION NOT NULL DEFAULT 1.0;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS market TEXT;
 ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_pkey;
 CREATE UNIQUE INDEX IF NOT EXISTS positions_pid_symbol_key ON positions (portfolio_id, symbol);
 

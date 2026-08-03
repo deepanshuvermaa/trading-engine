@@ -183,8 +183,9 @@ class Store:
             """
             INSERT INTO positions
                 (portfolio_id, symbol, side, entry_price, stop_loss,
-                 take_profit, size, module, opened_at, reasons, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+                 take_profit, size, module, opened_at, reasons,
+                 currency, fx_rate, market, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
             ON CONFLICT (portfolio_id, symbol) DO UPDATE SET
                 side = EXCLUDED.side,
                 entry_price = EXCLUDED.entry_price,
@@ -194,6 +195,9 @@ class Store:
                 module = EXCLUDED.module,
                 opened_at = EXCLUDED.opened_at,
                 reasons = EXCLUDED.reasons,
+                currency = EXCLUDED.currency,
+                fx_rate = EXCLUDED.fx_rate,
+                market = EXCLUDED.market,
                 updated_at = now()
             """,
             p.get("portfolio_id") or "DISTRIBUTED",
@@ -201,6 +205,8 @@ class Store:
             float(p["stop_loss"]), float(p["take_profit"]), float(p["size"]),
             p.get("module"), p.get("opened_at"),
             _jsonable(p.get("reasons") or []),
+            p.get("currency") or "USD", float(p.get("fx_rate") or 1.0),
+            p.get("market"),
         )
 
     async def delete_position(self, symbol: str,
@@ -219,6 +225,15 @@ class Store:
                 "take_profit": r["take_profit"], "size": r["size"],
                 "module": r["module"], "opened_at": r["opened_at"],
                 "reasons": r["reasons"] or [],
+                # Restore currency/fx/market so an NSE position comes back as
+                # INR/its-fx, not the USD default -- the field that was missing
+                # end-to-end (schema, upsert, and here) and caused the
+                # recurring currency reversion on every restart. The schema's
+                # ALTER ... ADD COLUMN IF NOT EXISTS backfills these on every
+                # existing row, so they're always present after init().
+                "currency": r["currency"] or "USD",
+                "fx_rate": r["fx_rate"] or 1.0,
+                "market": r["market"],
             }
             for r in rows
         ]
