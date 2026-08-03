@@ -43,31 +43,68 @@ LOOKBACK_DAYS = 730  # ~2 calendar years
 # symbols get backtested are, by construction, the same kind of names the
 # system would genuinely be looking at today.
 #
-# This is still a single point-in-time snapshot (today's movers), not a
-# true rolling universe (a different basket reconstructed for every
-# historical day, matching what discovery would have surfaced ON that
-# date) -- that's the gold-standard version and a materially bigger build
-# (it needs day-by-day historical bhavcopy/screener reconstruction). Flagged
-# honestly as a known limitation, not silently glossed over.
+# NSE gets the gold-standard treatment: a TRUE ROLLING universe, reconstructed
+# monthly from real historical NSE bhavcopy (backtest/rolling_universe.py) --
+# a different, date-correct basket at each of ~24 monthly rebalance points
+# across the lookback window, with no lookahead (a rebalance point never
+# reads bhavcopy data from after its own date). This is possible for NSE
+# ONLY because jugaad_data's full_bhavcopy_save(date, dir) genuinely accepts
+# an arbitrary historical date.
+#
+# Crypto and US remain a SINGLE point-in-time snapshot (today's movers)
+# applied across the entire window -- NOT a design choice, a hard data-source
+# limitation: CoinGecko's free markets endpoint has no historical
+# top-volume-by-date API, and yfinance's day_gainers/day_losers/most_actives
+# screeners are live-only with no historical-date parameter. There is no
+# free, real data source that answers "what would have been top-movers by
+# volume on 2024-11-01" for either market. Flagged honestly here and in the
+# generated report, not silently glossed over.
 BASKET_SIZE_PER_MARKET = 15
 
 
-async def _discover_baskets() -> dict[str, dict[str, tuple[str, str]]]:
-    """Pull TODAY's real top-movers/most-active per market via the live
-    UniverseDiscovery mechanism -- no fixed list. Sector/company-name labels
-    aren't available from discovery, so symbols are labeled honestly by
-    market rather than inventing a sector we didn't actually look up."""
+async def _discover_baskets(
+    lookback_days: int,
+) -> tuple[dict[str, dict[str, tuple[str, str]]], dict]:
+    """Crypto/US: TODAY's real top-movers/most-active via the live
+    UniverseDiscovery mechanism (single snapshot, applied across the whole
+    window -- see the module-level comment above for why).
+
+    NSE: a TRUE rolling reconstruction -- ~24 monthly rebalance points, each
+    asking "what would NSE's top movers/most-active basket have looked like
+    AS OF this historical date", via backtest.rolling_universe (real
+    bhavcopy, no lookahead). The union of everything discovered across all
+    rebalance points becomes the NSE fetch list; per-rebalance-point cohorts
+    are returned separately so the walk-forward simulation can restrict
+    which symbols are actually *scoreable* at any given simulated date.
+
+    Sector/company-name labels aren't available from discovery, so symbols
+    are labeled honestly by market/mechanism rather than inventing a sector
+    we didn't actually look up.
+    """
     from data.universe import UniverseDiscovery
+    from backtest.rolling_universe import build_rolling_nse_universe
 
     uni = await UniverseDiscovery().discover(force=True)
-    labels = {"crypto": "Live Universe Discovery — Crypto (24h volume rank)",
-              "us": "Live Universe Discovery — US (gainers/losers/most-active)",
-              "india": "Live Universe Discovery — NSE (top movers/turnover)"}
+    labels = {"crypto": "Live Universe Discovery — Crypto (24h volume rank; "
+                         "single live snapshot, applied across whole window — "
+                         "no free historical top-volume-by-date API)",
+              "us": "Live Universe Discovery — US (gainers/losers/most-active; "
+                    "single live snapshot, applied across whole window — "
+                    "yfinance screeners are live-only)"}
     baskets: dict[str, dict[str, tuple[str, str]]] = {}
-    for market in ("crypto", "us", "india"):
+    for market in ("crypto", "us"):
         symbols = list(uni.get(market, []))[:BASKET_SIZE_PER_MARKET]
         baskets[market] = {s: (s, labels[market]) for s in symbols}
-    return baskets
+
+    loop = asyncio.get_event_loop()
+    rolling = await loop.run_in_executor(
+        None, build_rolling_nse_universe, lookback_days, BASKET_SIZE_PER_MARKET, None)
+    india_label = (f"Rolling NSE Universe Reconstruction — "
+                   f"{len(rolling['rebalance_dates'])} monthly rebalance points, "
+                   f"real bhavcopy, no lookahead (backtest.rolling_universe)")
+    baskets["india"] = {s: (s, india_label) for s in rolling["union_symbols"]}
+
+    return baskets, rolling
 
 PROVIDER_LABEL: dict[str, str] = {
     "crypto": "CryptoProvider (Binance via ccxt, yfinance daily fallback)",
@@ -103,16 +140,19 @@ class FetchReport:
 
 async def fetch_all(
     lookback_days: int = LOOKBACK_DAYS,
-) -> tuple[dict[str, dict[str, pd.DataFrame]], list[FetchReport]]:
+) -> tuple[dict[str, dict[str, pd.DataFrame]], list[FetchReport], dict]:
     """Fetch 1D OHLCV for the representative baskets via the LIVE providers.
 
     Returns (data[market][symbol] -> DataFrame, audit reports — one per
-    symbol attempted, success or failure, for the authenticity trail).
+    symbol attempted, success or failure, for the authenticity trail,
+    rolling_universe — the NSE monthly rebalance-point metadata
+    (rebalance_dates/cohorts/union_symbols) from backtest.rolling_universe,
+    empty dict values for crypto/US since they're a single snapshot).
     """
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=lookback_days)
 
-    baskets = await _discover_baskets()
+    baskets, rolling = await _discover_baskets(lookback_days)
     total_discovered = sum(len(b) for b in baskets.values())
     log.info(f"historical_data: basket discovered live — "
              f"{ {m: len(b) for m, b in baskets.items()} } "
@@ -179,4 +219,4 @@ async def fetch_all(
         else:
             log.warning(f"  FAIL {r.market:6s} {r.symbol:12s} — {r.error}")
 
-    return data, reports
+    return data, reports, rolling

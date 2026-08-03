@@ -141,8 +141,10 @@ def _simulate_one_config(
     label: str, symbol_data: dict[str, dict[str, pd.DataFrame]],
     wfe: WalkForwardEvaluator, tmp_root: Path,
     rule_stats_src: Path | None, persona_stats_src: Path | None,
+    nse_cohorts: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     import autonomous
+    from backtest.rolling_universe import symbols_live_as_of
 
     run_dir = tmp_root / label
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -227,6 +229,27 @@ def _simulate_one_config(
             "persona_abstains": cons.get("abstains", []),
         })
 
+    # NSE rolling-universe gating: a symbol is only *scoreable* (new entries)
+    # once it's actually been discovered by the rolling reconstruction's most
+    # recent PRIOR (or same-date) monthly rebalance point — a symbol first
+    # discovered in month 18 must not be scoreable in month 2 of this same
+    # run, because on that historical date it genuinely wouldn't have been
+    # on the radar. Position MANAGEMENT (check_positions/SL/TP/trailing) of
+    # an already-open position is never gated — that's risk handling of a
+    # live trade, not a new-entry decision. Crypto/US are ungated (identical
+    # behavior to before this fix) — they only ever have one snapshot.
+    nse_symbols_gated = 0
+
+    def _scoreable(symbol: str, market: str, sim_date) -> bool:
+        nonlocal nse_symbols_gated
+        if market != "india" or not nse_cohorts:
+            return True
+        live = symbols_live_as_of(nse_cohorts, pd.Timestamp(sim_date).date())
+        ok = symbol in live
+        if not ok:
+            nse_symbols_gated += 1
+        return ok
+
     for d in all_dates:
         for symbol, (market, hold) in holds.items():
             if d not in hold.index:
@@ -244,6 +267,8 @@ def _simulate_one_config(
                 continue  # either still open, or just closed — no same-bar re-entry
 
             if len(portfolio.positions) >= engine.max_concurrent:
+                continue
+            if not _scoreable(symbol, market, d):
                 continue
             setup = engine.score_asset(portfolio, symbol, sub, macro=None,
                                         min_score=25.0, skip_cost_gate=False)
@@ -271,6 +296,27 @@ def _simulate_one_config(
     bt_engine = BacktestEngine(initial_capital=portfolio.initial_capital)
     metrics = bt_engine._compute_metrics(bt_trades)
 
+    # No-lookahead proof: for every NSE symbol that was actually discovered
+    # by the rolling reconstruction, confirm every entry this run took in
+    # that symbol happened ON OR AFTER the symbol's first discovery date —
+    # i.e. it was never scoreable/tradeable before it was genuinely on the
+    # radar. Concretely demonstrates the gating above did what it claims.
+    nse_lookahead_check: list[dict] = []
+    if nse_cohorts:
+        first_seen: dict[str, str] = {}
+        for iso_date, syms in nse_cohorts.items():
+            for s in syms:
+                if s not in first_seen or iso_date < first_seen[s]:
+                    first_seen[s] = iso_date
+        for symbol, discovered_on in sorted(first_seen.items()):
+            entry_dates = [t["entry_date"] for t in trade_log
+                           if t["symbol"] == symbol and t["market"] == "india"]
+            no_lookahead_ok = all(e >= discovered_on for e in entry_dates)
+            nse_lookahead_check.append({
+                "symbol": symbol, "first_discovered": discovered_on,
+                "entry_dates": entry_dates, "no_lookahead_ok": no_lookahead_ok,
+            })
+
     return {
         "label": label,
         "metrics": metrics.model_dump(),
@@ -280,13 +326,18 @@ def _simulate_one_config(
         "rule_stats_path_used": str(rule_stats_path),
         "final_equity": round(portfolio.equity, 4),
         "initial_capital": portfolio.initial_capital,
+        "nse_symbols_gated_count": nse_symbols_gated,
+        "nse_lookahead_check": nse_lookahead_check,
     }
 
 
-def _simulate_both(symbol_data: dict[str, dict[str, pd.DataFrame]]) -> dict[str, Any]:
+def _simulate_both(symbol_data: dict[str, dict[str, pd.DataFrame]],
+                    rolling: dict[str, Any] | None = None) -> dict[str, Any]:
     """Synchronous, CPU-bound. Callers should offload this to a thread
     (asyncio.to_thread) so it never blocks the live Scout/Sentry event loop."""
     import autonomous
+
+    nse_cohorts = (rolling or {}).get("cohorts") or {}
 
     tmp_root = Path(tempfile.mkdtemp(prefix="learning_validation_"))
     wfe = WalkForwardEvaluator()
@@ -308,10 +359,12 @@ def _simulate_both(symbol_data: dict[str, dict[str, pd.DataFrame]]) -> dict[str,
 
         naive = _simulate_one_config(
             "naive", symbol_data, wfe, tmp_root,
-            rule_stats_src=None, persona_stats_src=LIVE_PERSONA_STATS_PATH)
+            rule_stats_src=None, persona_stats_src=LIVE_PERSONA_STATS_PATH,
+            nse_cohorts=nse_cohorts)
         learned = _simulate_one_config(
             "learned", symbol_data, wfe, tmp_root,
-            rule_stats_src=LIVE_RULE_STATS_PATH, persona_stats_src=LIVE_PERSONA_STATS_PATH)
+            rule_stats_src=LIVE_RULE_STATS_PATH, persona_stats_src=LIVE_PERSONA_STATS_PATH,
+            nse_cohorts=nse_cohorts)
 
         rule_stats_after = (LIVE_RULE_STATS_PATH.read_bytes()
                              if LIVE_RULE_STATS_PATH.exists() else None)
@@ -403,7 +456,7 @@ def _fmt_pct(x: float) -> str:
 
 
 def build_report(sim: dict[str, Any], fetch_reports: list, lookback_days: int,
-                  started_at: datetime) -> dict[str, Any]:
+                  started_at: datetime, rolling: dict[str, Any] | None = None) -> dict[str, Any]:
     naive, learned = sim["naive"], sim["learned"]
     nm, lm = naive["metrics"], learned["metrics"]
 
@@ -470,6 +523,14 @@ def build_report(sim: dict[str, Any], fetch_reports: list, lookback_days: int,
     attribution = _weight_attribution(learned)
     feeds_next = _feeds_next_trade_examples(learned)
 
+    rolling = rolling or {}
+    rolling_universe_scope = {
+        "rebalance_dates": rolling.get("rebalance_dates", []),
+        "rebalance_point_count": len(rolling.get("rebalance_dates", [])),
+        "cohorts": rolling.get("cohorts", {}),
+        "union_symbols": rolling.get("union_symbols", []),
+    }
+
     scope = {
         "lookback_days": lookback_days,
         "started_at": started_at.isoformat(),
@@ -477,6 +538,7 @@ def build_report(sim: dict[str, Any], fetch_reports: list, lookback_days: int,
         "fetch_reports": [r.to_dict() for r in fetch_reports],
         "symbols_fetched_ok": sum(1 for r in fetch_reports if r.ok),
         "symbols_attempted": len(fetch_reports),
+        "nse_rolling_universe": rolling_universe_scope,
     }
 
     return {
@@ -506,6 +568,17 @@ def build_report(sim: dict[str, Any], fetch_reports: list, lookback_days: int,
                                       "15m-loop anti-churn gate compares to wall-clock time, which "
                                       "is meaningless replaying historical daily bars); identical "
                                       "for naive and learned so it cannot bias the comparison"),
+            "universe_reconstruction": (
+                "NSE uses a TRUE ROLLING universe: "
+                f"{rolling_universe_scope['rebalance_point_count']} monthly reconstructions from "
+                "real NSE bhavcopy (backtest.rolling_universe.build_rolling_nse_universe), no "
+                "lookahead — a symbol is only scoreable/tradeable from its own discovery date "
+                "forward (see nse_lookahead_check in the learned/naive run results). Crypto and US "
+                "use a SINGLE live-discovery snapshot (today's movers) applied across the whole "
+                "window — this is a data-source limitation (no free historical top-movers-by-date "
+                "API for either market), not a design choice; see code comments in "
+                "backtest/historical_data.py and backtest/rolling_universe.py for why."
+            ),
         },
         "comparison": {"naive": nm, "learned": lm},
         "verdict": {
@@ -572,6 +645,45 @@ def render_markdown(report: dict[str, Any]) -> str:
         for r in failed:
             L.append(f"- {r['market']}:{r['symbol']} — {r['error']}")
     L.append("")
+
+    L.append("## NSE Rolling Universe Reconstruction (real, date-correct — no lookahead)")
+    L.append("")
+    ru = scope.get("nse_rolling_universe", {})
+    L.append(f"NSE uses a true rolling universe: **{ru.get('rebalance_point_count', 0)} monthly "
+             f"reconstructions** from real NSE bhavcopy, one basket per rebalance point, each "
+             f"computed using ONLY bhavcopy data on or before that point's own date. Crypto/US "
+             f"remain a single live-discovery snapshot applied across the whole window — a data-"
+             f"source limitation (no free historical top-movers-by-date API for either market), "
+             f"not a design choice.")
+    L.append("")
+    L.append(f"Union of symbols discovered across all rebalance points "
+             f"({len(ru.get('union_symbols', []))} unique): "
+             f"{', '.join(ru.get('union_symbols', [])) or '(none discovered)'}")
+    L.append("")
+    L.append("| Rebalance date | Symbols discovered as of this date |")
+    L.append("|---|---|")
+    for d in ru.get("rebalance_dates", []):
+        syms = ru.get("cohorts", {}).get(d, [])
+        L.append(f"| {d} | {', '.join(syms) if syms else '(none — no bhavcopy in window)'} |")
+    L.append("")
+    lookahead_check = learned.get("nse_lookahead_check", [])
+    if lookahead_check:
+        n_gated = learned.get("nse_symbols_gated_count", 0)
+        all_ok = all(c["no_lookahead_ok"] for c in lookahead_check)
+        L.append(f"**No-lookahead proof** (learned run): {n_gated} would-be new-entry scoring "
+                 f"attempts were skipped because the symbol hadn't been discovered yet as of that "
+                 f"simulated date. For every NSE symbol ever discovered, every actual entry this "
+                 f"run took is confirmed to be on/after that symbol's first discovery date: "
+                 f"**{all_ok}**.")
+        L.append("")
+        L.append("| Symbol | First discovered | Entry dates taken this run | No-lookahead OK |")
+        L.append("|---|---|---|---|")
+        for c in lookahead_check:
+            if not c["entry_dates"]:
+                continue
+            L.append(f"| {c['symbol']} | {c['first_discovered']} | "
+                     f"{', '.join(c['entry_dates'])} | {c['no_lookahead_ok']} |")
+        L.append("")
 
     L.append("## Methodology")
     L.append("")
@@ -709,9 +821,9 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 async def run_learning_validation(lookback_days: int = LOOKBACK_DAYS) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc)
-    data, fetch_reports = await fetch_all(lookback_days)
-    sim = await asyncio.to_thread(_simulate_both, data)
-    report = build_report(sim, fetch_reports, lookback_days, started_at)
+    data, fetch_reports, rolling = await fetch_all(lookback_days)
+    sim = await asyncio.to_thread(_simulate_both, data, rolling)
+    report = build_report(sim, fetch_reports, lookback_days, started_at, rolling)
     return report
 
 
