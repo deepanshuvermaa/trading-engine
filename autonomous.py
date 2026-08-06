@@ -107,6 +107,10 @@ SLIPPAGE_PCT = _env_float("SLIPPAGE_PCT", 0.05)      # per fill, % of price
 # A setup's target must clear the (per-market) round-trip cost drag by this
 # multiple or the trade is skipped — no point entering when fees eat the edge.
 COST_EDGE_MULTIPLE = _env_float("COST_EDGE_MULTIPLE", 3.75)
+# Extra profit-target cushion: widen every take-profit by this % of price,
+# so each trade aims for a slightly larger REAL market move before exiting.
+# Env-tunable. Honest strategy param (targets a real move), not a P&L fudge.
+PROFIT_TARGET_BOOST_PCT = _env_float("PROFIT_TARGET_BOOST_PCT", 1.0)
 # Anti-churn: after closing a symbol, a cohort may not re-open it for this many
 # minutes. Stops the 15m loop from repeatedly round-tripping the same name and
 # bleeding fees. Env-overridable.
@@ -1300,10 +1304,10 @@ class AutonomousEngine:
         tp_mult = 6.4 if module == "trend_follower" else 4.2  # -> 3.2:1 vs 2.1:1
         if direction == "BUY":
             sl = price - 2 * at
-            tp = price + tp_mult * at
+            tp = price + tp_mult * at + PROFIT_TARGET_BOOST_PCT/100*price
         else:
             sl = price + 2 * at
-            tp = price - tp_mult * at
+            tp = price - tp_mult * at - PROFIT_TARGET_BOOST_PCT/100*price
 
         rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
 
