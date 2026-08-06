@@ -328,6 +328,35 @@ async def post_restate_trade(body: dict[str, Any] = Body(...)):
     return await engine.restate_trade(cohort, trade_id, float(fx_rate), reason)
 
 
+@app.post("/api/admin/reset")
+async def post_admin_reset(body: dict[str, Any] = Body(...)):
+    """CLEAN-SLATE reset of the whole book. DESTRUCTIVE — wipes trades,
+    positions, equity curve, memory log, audit events and attribution (DB +
+    in-memory) and re-seeds every cohort at its starting capital.
+
+    Guarded by the SAME shared secret as /api/universe/push-nse (RELAY_SECRET
+    env var): the body must carry a matching `secret`, otherwise an anonymous
+    caller could zero out a live engine's entire record.
+
+    Body:
+      secret         (str, required)  — must equal RELAY_SECRET.
+      reason         (str, required)  — recorded in the RESET audit event.
+      reset_learning (bool, default False) — if True, ALSO wipe the learned
+                     rule weights + attribution so the brain starts fresh;
+                     if False, the learned weights are KEPT.
+    """
+    import os
+    secret = os.environ.get("RELAY_SECRET", "")
+    if not secret or body.get("secret") != secret:
+        raise HTTPException(status_code=401, detail="invalid or missing secret")
+    reason = body.get("reason")
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason: str required")
+    reset_learning = bool(body.get("reset_learning", False))
+    engine = _require_engine()
+    return await engine.reset_all(reset_learning=reset_learning, reason=reason)
+
+
 @app.post("/api/refresh-news")
 async def post_refresh_news():
     """Force a fresh news/macro sweep, bypassing the cache."""

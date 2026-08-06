@@ -125,6 +125,31 @@ class Store:
         async with self.pool.acquire() as conn:
             return await conn.fetch(sql, *args)
 
+    # ── clean-slate reset ────────────────────────────────────────────────
+
+    # Only these tables may ever be wiped by the admin reset endpoint. A hard
+    # whitelist because the table name can't be a bound parameter (it's
+    # interpolated into the TRUNCATE), so this is the SQL-injection guard.
+    RESETTABLE_TABLES = frozenset({
+        "trades", "positions", "equity_curve", "memory_log",
+        "audit_events", "attribution", "rule_stats",
+    })
+
+    async def truncate_tables(self, tables) -> list[str]:
+        """TRUNCATE each whitelisted table. Returns the tables actually wiped.
+        No-op (returns []) when persistence is disabled."""
+        if not self.enabled:
+            return []
+        done: list[str] = []
+        async with self.pool.acquire() as conn:
+            for t in tables:
+                if t not in self.RESETTABLE_TABLES:
+                    log.warning(f"truncate_tables: refusing unknown table {t!r}")
+                    continue
+                await conn.execute(f"TRUNCATE TABLE {t} RESTART IDENTITY")
+                done.append(t)
+        return done
+
     # ── engine_state (one row PER cohort, keyed by portfolio_id) ──────────
 
     async def save_engine_state(self, state: dict) -> None:
@@ -245,8 +270,9 @@ class Store:
             """
             INSERT INTO trades
                 (id, portfolio_id, symbol, side, entry_price, exit_price, size,
-                 pnl, reason, module, rule_citations, detail)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 pnl, reason, module, rule_citations, detail,
+                 restated, original_pnl)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (portfolio_id, id) DO UPDATE SET
                 symbol = EXCLUDED.symbol,
                 side = EXCLUDED.side,
@@ -257,7 +283,9 @@ class Store:
                 reason = EXCLUDED.reason,
                 module = EXCLUDED.module,
                 rule_citations = EXCLUDED.rule_citations,
-                detail = EXCLUDED.detail
+                detail = EXCLUDED.detail,
+                restated = EXCLUDED.restated,
+                original_pnl = EXCLUDED.original_pnl
             """,
             t["id"], t.get("portfolio_id") or "DISTRIBUTED",
             t["symbol"], t.get("side"),
@@ -266,6 +294,7 @@ class Store:
             _jsonable(t.get("rule_citations") or []),
             _jsonable({k: v for k, v in t.items()
                        if k not in ("rule_citations",)}),
+            bool(t.get("restated", False)), _f(t.get("original_pnl")),
         )
 
     async def load_trades(self, limit: int = 1000,
@@ -284,6 +313,14 @@ class Store:
                 "entry": r["entry_price"], "exit": r["exit_price"],
                 "size": r["size"], "pnl": r["pnl"],
                 "reason": r["reason"], "module": r["module"],
+                # Restatement audit fields — mapped back so the idempotency
+                # guard in restate_trade survives a restart and the dashboard
+                # keeps the "restated" marker. pnl already holds the restated
+                # value (save_trade rewrote it); original_pnl is the pre-fix
+                # figure. restatement_reason lives in the detail JSONB blob.
+                "restated": bool(r["restated"]),
+                "original_pnl": r["original_pnl"],
+                "restatement_reason": d.get("restatement_reason"),
             })
         return out
 

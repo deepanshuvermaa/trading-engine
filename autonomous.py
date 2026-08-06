@@ -91,6 +91,12 @@ def _env_flag(name: str) -> bool:
 
 INITIAL_CAPITAL = _env_float("INITIAL_CAPITAL", 100.0)
 TARGET_EQUITY = _env_float("TARGET_EQUITY", 120.0)
+# Reaching the target is a MILESTONE, not a shutdown. By default the engine
+# keeps scanning and managing positions forever after hitting target (it only
+# flags target_achieved=True). A prior version broke out of the loop on target
+# and, after a FALSE trigger, sat idle for days. Set STOP_ON_TARGET=1 only if
+# you explicitly want the old halt-on-target behaviour back.
+STOP_ON_TARGET = _env_flag("STOP_ON_TARGET")
 SCAN_INTERVAL_MINUTES = _env_int("SCAN_INTERVAL_MINUTES", 30)  # Daily-mode rescan cadence
 MAX_POSITION_PCT = 10.0
 MAX_CONCURRENT = 3
@@ -466,6 +472,9 @@ class AutonomousEngine:
         self.cycle = 0
         self.running = True
         self.paused = False
+        # Target is NON-TERMINAL: this flag records that the milestone was hit
+        # (surfaced on the dashboard) but never stops the Scout/Sentry loops.
+        self.target_achieved = False
         self.last_scan_at: str | None = None
         self._scan_now_event = asyncio.Event()
 
@@ -940,6 +949,86 @@ class AutonomousEngine:
         return {"ok": True, "old_pnl": old_pnl, "new_pnl": new_pnl,
                 "equity_credit": round(delta, 4),
                 "new_equity": round(portfolio.equity, 2)}
+
+    async def reset_all(self, reset_learning: bool, reason: str) -> dict:
+        """CLEAN-SLATE reset. Wipes the book (trades, positions, equity curve,
+        memory log, audit events, attribution) both in Postgres and in memory,
+        and re-seeds every cohort at its starting capital. The learned brain
+        (rule weights + attribution regime stats) is KEPT unless
+        reset_learning=True, in which case it too is wiped so the engine starts
+        completely fresh.
+
+        Synchronous within the request handler (no mid-cycle handoff): callers
+        accept the tiny race against an in-flight cycle; the durable snapshot at
+        the end reflects the reset state regardless."""
+        # ── 1. Wipe the durable book in Postgres (whitelisted TRUNCATEs). Do
+        # this BEFORE logging the RESET audit event so the event survives the
+        # audit_events truncate.
+        book_tables = ["trades", "positions", "equity_curve",
+                       "memory_log", "audit_events", "attribution"]
+        if reset_learning:
+            book_tables.append("rule_stats")
+        cleared_tables = await self.store.truncate_tables(book_tables)
+
+        # ── 2. Reset every cohort's in-memory book to its starting capital.
+        cohorts_reset = []
+        for p in self.portfolios.values():
+            seed = p.initial_capital
+            p.equity = seed
+            p.peak_equity = seed
+            p.drawdown_pct = 0.0
+            p.cost_drag_total = 0.0
+            p.positions = {}
+            p.closed_trades = []
+            p.equity_curve = []
+            for name in p.agent_stats:
+                p.agent_stats[name] = {
+                    "wins": 0, "losses": 0, "pnl": 0.0, "trades": 0}
+            p._verdicts.clear()
+            p._entry_votes.clear()
+            p._position_consensus.clear()
+            p._last_closed.clear()
+            cohorts_reset.append({"cohort": p.id, "equity": round(seed, 4)})
+
+        # ── 3. Reset shared engine-level book state.
+        self.cycle = 0
+        self.target_achieved = False
+        self.memory = []
+
+        # ── 4. Optionally wipe the learned brain (rule weights + attribution).
+        learning_cleared = False
+        if reset_learning:
+            self.brain.stats.stats = {}
+            self.brain.stats.save()  # writes knowledge/rule_stats.json = {} (+DB no-op on empty)
+            self.attribution._regime_perf = {}
+            learning_cleared = True
+
+        # ── 5. Re-persist the clean cohort state rows.
+        self._persist_engine_state()
+
+        # ── 6. Audit + memory trail (persists: audit_events was already wiped).
+        self.audit.log_system_event("RESET", {
+            "reason": reason,
+            "reset_learning": reset_learning,
+            "cleared_tables": cleared_tables,
+            "cohorts_reset": cohorts_reset,
+            "learning_cleared": learning_cleared,
+        })
+        self._mem(
+            f"CLEAN-SLATE RESET: {len(cohorts_reset)} cohort(s) re-seeded at "
+            f"starting capital; tables wiped={cleared_tables or 'none (no DB)'}; "
+            f"learning {'CLEARED' if learning_cleared else 'kept'} — {reason}",
+            "SUCCESS")
+
+        await self.push_state()
+        return {
+            "ok": True,
+            "reason": reason,
+            "reset_learning": reset_learning,
+            "learning_cleared": learning_cleared,
+            "cleared_tables": cleared_tables,
+            "cohorts_reset": cohorts_reset,
+        }
 
     def market_of(self, symbol: str) -> str:
         """Classify a symbol's market. FAILS LOUD, not silent-default: an
@@ -1886,8 +1975,12 @@ class AutonomousEngine:
             "cohorts": cohorts,
             "cohort_count": len(cohorts),
             "primary_cohort": self.primary.id,
-            "status": ("TARGET_HIT" if self.equity >= self.target_equity
-                       else "PAUSED" if self.paused else "RUNNING"),
+            # Status reflects the loop's REAL state. Target is non-terminal, so
+            # a target-reached engine still reports RUNNING (not a terminal
+            # "TARGET_HIT" that reads as idle) — target_achieved carries the
+            # milestone separately.
+            "status": ("PAUSED" if self.paused
+                       else "RUNNING"),
             "capital": self.initial_capital,
             "target": self.target_equity,
             "scan_interval_minutes": self.scan_interval_minutes,
@@ -1908,7 +2001,7 @@ class AutonomousEngine:
             "cost_drag_total": round(self.cost_drag_total, 4),
             "cost_by_market": self._cost_by_market_snapshot(),
             "total_return_pct": round((self.equity - self.initial_capital) / self.initial_capital * 100, 2),
-            "target_achieved": self.equity >= self.target_equity,
+            "target_achieved": self.target_achieved or self.equity >= self.target_equity,
             "open_positions": [p.to_dict() for p in self.positions.values()],
             "trade_journal": self.closed_trades[-100:],
             "equity_curve": self.equity_curve[-500:],
@@ -2102,10 +2195,33 @@ class AutonomousEngine:
                 self._mem(f"Daily loop error: {e}", "FAIL")
                 log.error(traceback.format_exc())
 
-        # 7. Check target
+        # 7. Check target — NON-TERMINAL milestone. Reaching the target flags
+        # target_achieved and logs it ONCE, but the engine keeps scanning and
+        # managing positions indefinitely. It does NOT break/return out of the
+        # loop (a prior version set self.running=False here and, after a FALSE
+        # target trigger, the engine sat dead for days). Only the explicit
+        # STOP_ON_TARGET opt-in restores the old halt behaviour.
         if self.equity >= self.target_equity:
-            self._mem(f"TARGET HIT! Equity ${self.equity:.2f} >= ${self.target_equity:.2f}", "SUCCESS")
-            self.running = False
+            if not self.target_achieved:
+                self.target_achieved = True
+                self._mem(
+                    f"TARGET ACHIEVED! Equity ${self.equity:.2f} >= "
+                    f"${self.target_equity:.2f} — target is non-terminal, "
+                    f"engine keeps scanning/managing positions", "SUCCESS")
+                self.audit.log_system_event("TARGET_ACHIEVED", {
+                    "equity": round(self.equity, 4),
+                    "target_equity": round(self.target_equity, 4),
+                    "cycle": self.cycle,
+                    "stop_on_target": STOP_ON_TARGET,
+                })
+            if STOP_ON_TARGET:
+                self._mem("STOP_ON_TARGET set — halting engine after target.",
+                          "info")
+                self.running = False
+        elif self.target_achieved:
+            # Equity slipped back below target (e.g. after a restatement or an
+            # open position marking down) — the milestone no longer holds.
+            self.target_achieved = False
 
     # ── The daily improvement loop (Karpathy keep-or-revert) ────────
 

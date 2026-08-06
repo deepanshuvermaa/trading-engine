@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS trades (
     detail         JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 ALTER TABLE trades ADD COLUMN IF NOT EXISTS portfolio_id TEXT NOT NULL DEFAULT 'DISTRIBUTED';
+-- Trade-level corrections MUST persist, exactly like the positions currency/fx
+-- columns above. A restatement (restate_trade) rewrites the pnl column, but
+-- without these dedicated columns the "this trade was restated" fact and the
+-- pre-restatement figure lived only in the JSONB blob and were never mapped
+-- back on load -- so after a restart the idempotency guard couldn't see the
+-- prior restatement (double-credit risk) and the dashboard lost the marker.
+-- ADD COLUMN IF NOT EXISTS backfills every existing row (restated=false).
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS restated BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS original_pnl DOUBLE PRECISION;
 ALTER TABLE trades DROP CONSTRAINT IF EXISTS trades_pkey;
 CREATE UNIQUE INDEX IF NOT EXISTS trades_pid_id_key ON trades (portfolio_id, id);
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades (ts);
