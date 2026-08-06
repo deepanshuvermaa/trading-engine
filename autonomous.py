@@ -1356,7 +1356,7 @@ class AutonomousEngine:
         # live path. Applying it here too was silently zeroing out NSE's
         # watchlist entirely (its flat brokerage floor easily exceeds any
         # realistic ATR-based target move at small notional).
-        if not skip_cost_gate and tp_move_pct < cost_floor:
+        if not skip_cost_gate and market != "india" and tp_move_pct < cost_floor:
             flat_note = "flat-fee " if market == "india" else ""
             log.info(f"SKIP {symbol} [{portfolio.id}]: {flat_note}cost {rt_cost_pct:.2f}% "
                      f"round-trip at ${planned_notional_usd:.0f} notional exceeds edge — "
