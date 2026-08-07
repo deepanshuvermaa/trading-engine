@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import feedparser
@@ -53,7 +53,7 @@ async def fetch_feed(name: str, url: str) -> list[dict[str, Any]]:
                 "summary": entry.get("summary", "")[:500],
                 "link": entry.get("link", ""),
                 "published": entry.get("published", ""),
-                "fetched_at": datetime.utcnow().isoformat(),
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
             })
         return entries
     except Exception as e:
