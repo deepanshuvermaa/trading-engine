@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -403,6 +404,25 @@ async def dashboard():
 # simulation, so it never blocks the live Scout/Sentry loops. Guarded by a
 # simple in-progress flag against concurrent runs.
 
+# The learning-validation backtest is a multi-minute, CPU + memory heavy run
+# (historical data pull + two full walk-forward simulations) — it was the
+# ~5.44 GB RAM spike that OOM-killed the $5 Railway plan. It is DISABLED on the
+# live server by default and only enabled where ENABLE_BACKTEST is truthy
+# (i.e. locally). The heavy imports (backtest.learning_validation,
+# backtest.historical_data, ...) are done lazily INSIDE _run_backtest_background
+# so they never load into the live server process while disabled.
+def _backtest_enabled() -> bool:
+    return os.environ.get("ENABLE_BACKTEST", "").strip().lower() in {
+        "1", "true", "yes", "on"}
+
+
+_BACKTEST_DISABLED_MSG = (
+    "Backtests are disabled on the live server — they are CPU/RAM heavy "
+    "(multi-GB) and would OOM the deployment. Run them locally with "
+    "ENABLE_BACKTEST=1 (e.g. `python -m backtest.learning_validation`)."
+)
+
+
 _BACKTEST_STATE: dict[str, Any] = {
     "running": False,
     "started_at": None,
@@ -459,7 +479,12 @@ async def get_backtest_learning_validation(lookback_days: int = 730):
     """Trigger the naive-vs-learned validation run in the background (takes
     several minutes — data pull + two full walk-forward simulations) and
     return the last COMPLETED report's summary + where to find the full
-    file. Poll this same endpoint (or /api/backtest/status) for progress."""
+    file. Poll this same endpoint (or /api/backtest/status) for progress.
+
+    Gated behind ENABLE_BACKTEST (OFF on the live server): when disabled this
+    returns 403 and does NOT import or run the heavy backtest path."""
+    if not _backtest_enabled():
+        raise HTTPException(status_code=403, detail=_BACKTEST_DISABLED_MSG)
     if _BACKTEST_STATE["running"]:
         return {"ok": True, "triggered": False, "reason": "already running",
                 **_backtest_summary()}

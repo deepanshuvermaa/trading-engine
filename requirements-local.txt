@@ -1,0 +1,17 @@
+# Local-only dependencies — NOT installed on the deployed Railway image.
+#
+# These are the heavy FinBERT dependencies (torch + transformers). They are
+# kept out of requirements.txt because they dominate the RAM footprint on the
+# $5 Railway plan. macro/sentiment.py lazy-loads transformers/torch inside its
+# functions and degrades gracefully to neutral sentiment when they are absent,
+# so the deployed engine runs fine without them.
+#
+# For local development / running FinBERT sentiment scoring, install both the
+# deployed deps and these:
+#     pip install -r requirements.txt -r requirements-local.txt
+#
+# CPU-only torch (smaller wheel) can be installed with:
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+transformers>=4.35.0
+torch>=2.0.0

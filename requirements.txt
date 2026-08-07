@@ -10,8 +10,10 @@ pandas>=2.0.0
 numpy>=1.24.0
 
 # Sentiment & NLP
-transformers>=4.35.0
-torch>=2.0.0
+# NOTE: transformers + torch (FinBERT) are intentionally NOT installed on the
+# deployed image — they dominate the RAM footprint on the $5 Railway plan.
+# macro/sentiment.py lazy-loads them and falls back to neutral sentiment when
+# absent. For local FinBERT scoring: pip install -r requirements-local.txt
 feedparser>=6.0.0
 praw>=7.7.0
 
